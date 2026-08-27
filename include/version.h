@@ -1,0 +1,6 @@
+#ifndef SMALLBOX_VERSION_H
+#define SMALLBOX_VERSION_H
+
+#define SMALLBOX_WIZARD_VERSION "0.2.0-r28"
+
+#endif
