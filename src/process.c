@@ -173,7 +173,7 @@ static int process_run_internal(char *const argv[], const char *stdin_text,
 			emit_lines(pending, &pending_length, buffer, (size_t)result,
 				callback, opaque);
 			if (tick && tick_ms) {
-				uint64_t now = current_milliseconds();
+				now = current_milliseconds();
 				if (now >= next_tick) {
 					tick(opaque);
 					next_tick = now + tick_ms;

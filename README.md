@@ -10,8 +10,14 @@ image composition and first-boot workflow.
 
 The wizard is controlled with a standard receiver remote through Linux evdev.
 It uses the common navigation keys (`UP`, `DOWN`, `LEFT`, `RIGHT`, `OK`, and
-`BACK`) and contains no receiver-specific remote-control mapping. All text shown
-on the television is English.
+`BACK`) and contains no receiver-specific remote-control mapping. `INFO` shows
+the version and the licenses. All text shown on the television is English, as
+the wizard runs before any locale is installed.
+
+The interface follows the Open Recovery Manager: the steps on the left, done
+ones checked, a summary of the setup above the screens on the right, and the
+keys in the footer. It is drawn with LVGL into framebuffers with 16, 24 or 32
+bits per pixel, from 720 x 576 up.
 
 Setup is mandatory. Enigma2 remains blocked until the wizard has completed and
 `/etc/smallbox-wizard.done` exists. Before launching the wizard, the SysV init
@@ -218,11 +224,17 @@ exceptions.
 
 ## Building the program
 
-The native executable requires only libc and Linux kernel headers:
+LVGL is the submodule `lib/lvgl`, configured by `include/lv_conf.h`. Besides it
+the executable requires only libc, libm and Linux kernel headers:
 
 ```sh
+git submodule update --init
 make
 ```
+
+The fonts in `src/fonts` are rendered by `tools/mkfonts.sh` and the licenses of
+the About page in `include/licenses.h` by `tools/mklicenses.py`; both are
+committed, so a build needs neither Node.js nor Python.
 
 The OpenEmbedded recipe supplies the cross compiler, flags, runtime tools, init
 script, and generated `/etc/smallbox-wizard.conf`.
@@ -233,11 +245,17 @@ Useful diagnostic commands:
 smallbox-wizard --version
 smallbox-wizard --list-devices
 smallbox-wizard --no-reboot
+smallbox-wizard --demo
 ```
 
 `--no-reboot` suppresses only the final reboot. It is not a dry run: confirmed
 partitioning, formatting, copying, and installation operations still take
 effect.
+
+`--demo` is the dry run: it shows every step with a fake USB device, simulated
+work and a simulated package failure. It changes nothing, real USB devices are
+listed but never partitioned, and it neither writes a marker nor reboots. Stop
+Enigma2 first, it needs the framebuffer.
 
 ## Current scope
 
