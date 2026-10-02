@@ -192,7 +192,7 @@ static void put_pixels(const struct ui_context *ui, uint8_t *to, const uint8_t *
 	}
 }
 
-static void flush(lv_display_t *disp, const lv_area_t *area, uint8_t *pixels)
+static void flush(lv_display_t *disp, const lv_area_t *area, uint8_t *pixels)  /* NOSONAR the flush callback type of LVGL */
 {
 	const struct ui_context *ui = active;
 	if (ui && ui->screen) {
@@ -725,18 +725,20 @@ static void summary(lv_obj_t *parent)
 	lv_obj_set_style_pad_row(obj, px(12), 0);
 	snprintf(copy, sizeof(copy), "%s", summary_text);
 	while (line && *line) {
-		char *next = strchr(line, '\n');
-		char *value;
+		size_t length = strcspn(line, "\n");
+		size_t name_length = strcspn(line, "\t\n");
+		int last = !line[length];
+		const char *value = "";
 		lv_obj_t *cell = column(obj, px(4));
-		if (next)
-			*next++ = '\0';
-		value = strchr(line, '\t');
-		if (value)
-			*value++ = '\0';
+		line[length] = '\0';
+		if (name_length < length) {
+			line[name_length] = '\0';
+			value = line + name_length + 1;
+		}
 		lv_obj_set_width(cell, LV_SIZE_CONTENT);
 		label(cell, line, FONT_SMALL, COLOR_MUTED);
-		label(cell, value ? value : "", FONT_TEXT, value && *value ? COLOR_TEXT : COLOR_DIM);
-		line = next;
+		label(cell, value, FONT_TEXT, *value ? COLOR_TEXT : COLOR_DIM);
+		line = last ? NULL : line + length + 1;
 	}
 }
 

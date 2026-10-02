@@ -110,8 +110,13 @@ static void step(enum step current)
 	static const char *const icons[STEP_COUNT] = {UI_ICON_WELCOME, UI_ICON_MODE, UI_ICON_STORAGE, UI_ICON_NETWORK,
 		UI_ICON_INSTALL, UI_ICON_FINISH};
 	char marks[STEP_COUNT];
-	for (int i = 0; i < STEP_COUNT; ++i)
-		marks[i] = i < (int)current ? 1 : i > (int)current ? 2 : 0;
+	for (int i = 0; i < STEP_COUNT; ++i) {
+		marks[i] = 0;
+		if (i < (int)current)
+			marks[i] = 1;
+		else if (i > (int)current)
+			marks[i] = 2;
+	}
 	ui_sidebar(&app.ui, names, icons, STEP_COUNT, marks);
 	ui_sidebar_select(&app.ui, current, 0);
 }
@@ -277,13 +282,10 @@ static int demo_install_packages(void)
 	struct network_package_failure failure = {.package = "enigma2-plugin-demo", .detail =
 		"Demo: a package that cannot be downloaded.", .status = 255, .total = 663, .installed = 331, .remaining = 332};
 	demo_work(statuses, 2, 3000);
-	switch (package_failure(&failure, NULL)) {
-	case NETWORK_PACKAGE_ABORT:
+	if (package_failure(&failure, NULL) == NETWORK_PACKAGE_ABORT)
 		return 0;
-	default:
-		demo_work(statuses + 2, 3, 4000);
-		return 1;
-	}
+	demo_work(statuses + 2, 3, 4000);
+	return 1;
 }
 
 /* USB storage */
@@ -315,68 +317,94 @@ static int confirm_erase(const struct storage_device *device, int chkroot)
 	return choose("Final confirmation", NULL, warning, second, 2, 0, "Confirm") == 1;
 }
 
-/* Chooses and prepares the USB device, with the layout for Chkroot. */
-static int configure_storage(const struct multiboot_config *config, int chkroot, char *uuid, size_t uuid_size,
-	struct multiboot_layout *layout)
+/* The text above the list of USB devices. */
+static const char *storage_hint(int count, int chkroot)
+{
+	if (!count)
+		return chkroot ? "Connect a USB device with at least 2 GB, then scan again." :
+			"Connect a USB device with at least 1 GB, then scan again.";
+	if (chkroot)
+		return "It will hold the complete Enigma2 root file system. Only real USB block devices are shown.";
+	return "/usr of the receiver moves there. Only real USB block devices are shown.";
+}
+
+/* The USB devices with the fake one of the demo, at most UI_MAX_ITEMS - 1; -1 when the scan failed. */
+static int scan_devices(struct storage_device devices[STORAGE_MAX_DEVICES], char *error, size_t error_size)
+{
+	int count = storage_scan_usb(devices, STORAGE_MAX_DEVICES, error, error_size);
+	if (count < 0)
+		return -1;
+	if (app.demo && count < STORAGE_MAX_DEVICES)
+		devices[count++] = (struct storage_device){.name = "sdx", .path = "/dev/sdx",
+			.model = "Demo USB stick", .size_bytes = 32ULL << 30, .removable = 1};
+	return count > UI_MAX_ITEMS - 1 ? UI_MAX_ITEMS - 1 : count;
+}
+
+/* What the USB setup prepares: the UUID of FlashExpander or the layout of Chkroot. */
+struct storage_target {
+	const struct multiboot_config *config;
+	int chkroot;
+	char *uuid;
+	size_t uuid_size;
+	struct multiboot_layout *layout;
+};
+
+/* Partitions and prepares the chosen device, 1 when done. */
+static int prepare_device(const struct storage_device *device, const struct storage_target *target, char *error,
+	size_t error_size)
+{
+	int result;
+	app.busy = 1;
+	start_progress(target->chkroot ? "Setting up Chkroot on USB" : "Setting up the USB storage");
+	if (app.demo) {
+		static const char *const statuses[] = {"Creating the partitions", "Formatting", "Activating swap",
+			"Copying /usr"};
+		demo_work(statuses, target->chkroot ? 3 : 4, 5000);
+		snprintf(target->uuid, target->uuid_size, "demo");
+		result = 1;
+	} else if (target->chkroot)
+		result = multiboot_prepare(device, target->config, progress, NULL, target->layout, error, error_size);
+	else
+		result = storage_prepare(device, progress, NULL, target->uuid, target->uuid_size, error, error_size);
+	app.busy = 0;
+	return result;
+}
+
+/* Chooses and prepares the USB device. */
+static int configure_storage(const struct storage_target *target)
 {
 	struct storage_device devices[STORAGE_MAX_DEVICES];
 	char labels[UI_MAX_ITEMS][192];
 	const char *items[UI_MAX_ITEMS];
 	char error[512];
-	int count;
-	int choice;
 	for (;;) {
-		struct storage_device *device;
-		int result;
-		count = storage_scan_usb(devices, STORAGE_MAX_DEVICES, error, sizeof(error));
+		const struct storage_device *device;
+		char capacity[32];
+		int choice;
+		int count = scan_devices(devices, error, sizeof(error));
 		if (count < 0) {
 			show_error("USB detection failed", error);
 			return 0;
 		}
-		if (app.demo && count < STORAGE_MAX_DEVICES)
-			devices[count++] = (struct storage_device){.name = "sdx", .path = "/dev/sdx",
-				.model = "Demo USB stick", .size_bytes = 32ULL << 30, .removable = 1};
-		if (count > UI_MAX_ITEMS - 1)
-			count = UI_MAX_ITEMS - 1;
 		for (int i = 0; i < count; ++i) {
 			device_text(&devices[i], labels[i], sizeof(labels[i]));
 			items[i] = labels[i];
 		}
 		items[count] = "Scan for USB devices again";
-		choice = choose("Choose the USB device",
-			count ? (chkroot ? "It will hold the complete Enigma2 root file system. Only real USB block devices "
-			"are shown." : "/usr of the receiver moves there. Only real USB block devices are shown.") :
-			(chkroot ? "Connect a USB device with at least 2 GB, then scan again." :
-			"Connect a USB device with at least 1 GB, then scan again."),
-			NULL, items, count + 1, 0, "Continue");
+		choice = choose("Choose the USB device", storage_hint(count, target->chkroot), NULL, items, count + 1, 0,
+			"Continue");
 		if (stop_requested || choice < 0)
 			return 0;
 		if (choice == count)
 			continue;
 		device = &devices[choice];
-		{
-			char capacity[32];
-			storage_format_size(device->size_bytes, capacity, sizeof(capacity));
-			snprintf(app.setup.usb, sizeof(app.setup.usb), "%.96s, %s", device->model, capacity);
-		}
-		if (!confirm_erase(device, chkroot)) {
+		storage_format_size(device->size_bytes, capacity, sizeof(capacity));
+		snprintf(app.setup.usb, sizeof(app.setup.usb), "%.96s, %s", device->model, capacity);
+		if (!confirm_erase(device, target->chkroot)) {
 			app.setup.usb[0] = '\0';
 			continue;
 		}
-		app.busy = 1;
-		start_progress(chkroot ? "Setting up Chkroot on USB" : "Setting up the USB storage");
-		if (app.demo) {
-			static const char *const statuses[] = {"Creating the partitions", "Formatting", "Activating swap",
-				"Copying /usr"};
-			demo_work(statuses, chkroot ? 3 : 4, 5000);
-			snprintf(uuid, uuid_size, "demo");
-			result = 1;
-		} else if (chkroot)
-			result = multiboot_prepare(device, config, progress, NULL, layout, error, sizeof(error));
-		else
-			result = storage_prepare(device, progress, NULL, uuid, uuid_size, error, sizeof(error));
-		app.busy = 0;
-		if (result)
+		if (prepare_device(device, target, error, sizeof(error)))
 			return 1;
 		app.setup.usb[0] = '\0';
 		show_error("USB setup failed", error);
@@ -385,38 +413,70 @@ static int configure_storage(const struct multiboot_config *config, int chkroot,
 
 /* Network */
 
+/* The choices of the network screen: map is -2 for the existing connection, -3 to scan again, else the index of
+ * the interface. Returns how many. */
+static int network_items(const struct network_interface interfaces[], int count, const char *current_interface,
+	const char *current_address, char labels[][160], const char *items[], int map[])
+{
+	int item_count = 0;
+	if (current_interface[0]) {
+		snprintf(labels[item_count], sizeof(labels[item_count]), "Use the existing connection\t%.31s\t%.47s",
+			current_interface, current_address);
+		items[item_count] = labels[item_count];
+		map[item_count++] = -2;
+	}
+	for (int i = 0; i < count; ++i) {
+		if (item_count >= UI_MAX_ITEMS - 1)
+			break;
+		if (interfaces[i].wireless)
+			continue;
+		snprintf(labels[item_count], sizeof(labels[item_count]), "LAN with DHCP\t%.31s\t%s", interfaces[i].name,
+			interfaces[i].link ? "Cable connected" : "No link");
+		items[item_count] = labels[item_count];
+		map[item_count++] = i;
+	}
+	items[item_count] = "Scan for network interfaces again";
+	map[item_count++] = -3;
+	return item_count;
+}
+
+/* DHCP on the interface, 1 when it has an address. */
+static int connect_interface(const struct network_interface *interface, char *chosen_address, size_t address_size,
+	char *error, size_t error_size)
+{
+	int result = 1;
+	app.busy = 1;
+	start_progress("Setting up the network");
+	if (app.demo) {
+		static const char *const statuses[] = {"Requesting an address with DHCP"};
+		demo_work(statuses, 1, 2000);
+		snprintf(chosen_address, address_size, "%s", interface->address[0] ? interface->address :
+			"192.168.0.99");  /* NOSONAR a made-up address of the demo */
+	} else
+		result = network_configure_dhcp(interface->name, progress, NULL, chosen_address, address_size, error,
+			error_size);
+	app.busy = 0;
+	return result;
+}
+
 static int configure_network(char *chosen_interface, size_t interface_size, char *chosen_address,
 	size_t address_size)
 {
 	struct network_interface interfaces[NETWORK_MAX_INTERFACES];
 	char labels[UI_MAX_ITEMS][160];
 	const char *items[UI_MAX_ITEMS];
-	char current_interface[32] = "";
-	char current_address[48] = "";
 	char error[512];
 	int map[UI_MAX_ITEMS];
 	for (;;) {
+		char current_interface[32] = "";
+		char current_address[48] = "";
 		int count = network_scan(interfaces, NETWORK_MAX_INTERFACES);
-		int item_count = 0;
+		int item_count;
 		int choice;
-		int i;
-		if (network_has_ipv4(current_interface, sizeof(current_interface), current_address,
-			sizeof(current_address))) {
-			snprintf(labels[item_count], sizeof(labels[item_count]), "Use the existing connection\t%.31s\t%.47s",
-				current_interface, current_address);
-			items[item_count] = labels[item_count];
-			map[item_count++] = -2;
-		}
-		for (i = 0; i < count && item_count < UI_MAX_ITEMS - 1; ++i) {
-			if (interfaces[i].wireless)
-				continue;
-			snprintf(labels[item_count], sizeof(labels[item_count]), "LAN with DHCP\t%.31s\t%s", interfaces[i].name,
-				interfaces[i].link ? "Cable connected" : "No link");
-			items[item_count] = labels[item_count];
-			map[item_count++] = i;
-		}
-		items[item_count] = "Scan for network interfaces again";
-		map[item_count++] = -3;
+		if (!network_has_ipv4(current_interface, sizeof(current_interface), current_address,
+			sizeof(current_address)))
+			current_interface[0] = '\0';
+		item_count = network_items(interfaces, count, current_interface, current_address, labels, items, map);
 		choice = choose("Set up the network",
 			"The installation needs internet access. The wizard sets up wired LAN with DHCP, Wi-Fi can be set up "
 			"later in Enigma2.", NULL, items, item_count, 0, "Connect");
@@ -429,23 +489,10 @@ static int configure_network(char *chosen_interface, size_t interface_size, char
 			snprintf(chosen_address, address_size, "%s", current_address);
 			return 1;
 		}
-		i = map[choice];
-		app.busy = 1;
-		start_progress("Setting up the network");
-		if (app.demo) {
-			static const char *const statuses[] = {"Requesting an address with DHCP"};
-			demo_work(statuses, 1, 2000);
-			snprintf(chosen_address, address_size, "%s", interfaces[i].address[0] ? interfaces[i].address :
-				"192.168.0.99");
-			error[0] = '\0';
-		}
-		if (app.demo || network_configure_dhcp(interfaces[i].name, progress, NULL, chosen_address, address_size,
-			error, sizeof(error))) {
-			app.busy = 0;
-			snprintf(chosen_interface, interface_size, "%s", interfaces[i].name);
+		if (connect_interface(&interfaces[map[choice]], chosen_address, address_size, error, sizeof(error))) {
+			snprintf(chosen_interface, interface_size, "%s", interfaces[map[choice]].name);
 			return 1;
 		}
-		app.busy = 0;
 		show_error("Network setup failed", error);
 	}
 }
@@ -453,7 +500,7 @@ static int configure_network(char *chosen_interface, size_t interface_size, char
 /* Installation */
 
 /* 1 when installed, -1 to set up the network again, 0 to stop. */
-static int install(const struct multiboot_config *config, struct multiboot_layout *layout, int chkroot)
+static int install(const struct multiboot_config *config, const struct multiboot_layout *layout, int chkroot)
 {
 	const char *const items[] = {chkroot ? "Download and install the image" : "Install the SmallBox packages now",
 		"Set up the network again"};
@@ -502,6 +549,7 @@ static int write_done_marker(const char *uuid, const char *interface, const char
 	int fd = mkstemp(temporary);
 	FILE *file;
 	time_t now = time(NULL);
+	int saved;
 	if (fd < 0) {
 		snprintf(error, error_size, "The completion marker cannot be created: %s", strerror(errno));
 		return 0;
@@ -516,7 +564,10 @@ static int write_done_marker(const char *uuid, const char *interface, const char
 	}
 	fprintf(file, "version=%s\ncompleted=%lld\nuuid=%s\ninterface=%s\nip=%s\n", VERSION, (long long)now,
 		uuid ? uuid : "", interface ? interface : "", address ? address : "");
-	if (fflush(file) != 0 || fsync(fd) != 0 || fclose(file) != 0 || rename(temporary, DONE_MARKER) != 0) {
+	saved = fflush(file) == 0 && fsync(fd) == 0;
+	if (fclose(file) != 0)  /* Closed also after a failed flush. */
+		saved = 0;
+	if (!saved || rename(temporary, DONE_MARKER) != 0) {
 		unlink(temporary);
 		snprintf(error, error_size, "The completion marker could not be saved: %s", strerror(errno));
 		return 0;
@@ -582,153 +633,209 @@ static int previous_setup(void)
 	}
 }
 
-static int run_wizard(void)
-{
+/* What the wizard sets up, filled step by step. */
+struct wizard {
 	struct multiboot_config config;
 	struct multiboot_layout layout;
-	struct setup *s = &app.setup;
-	char uuid[128] = "";
-	char interface[32] = "";
-	char address[48] = "";
+	char uuid[128];
+	char interface[32];
+	char address[48];
 	char error[512];
-	char footer[96];
-	int active = 0;
-	int chkroot = 0;
+	int chkroot;
+};
 
+/* The configuration and the start of the summary, 0 when it cannot be read. */
+static int load_setup(struct wizard *w)
+{
+	struct setup *s = &app.setup;
 	if (app.demo)
-		demo_config(&config);
-	else if (!multiboot_config_load(&config, error, sizeof(error))) {
-		show_error("Wizard configuration", error);
-		return 1;
+		demo_config(&w->config);
+	else if (!multiboot_config_load(&w->config, w->error, sizeof(w->error))) {
+		show_error("Wizard configuration", w->error);
+		return 0;
 	}
-	snprintf(s->receiver, sizeof(s->receiver), "%s", config.machine_build[0] ? config.machine_build :
-		config.machine);
+	snprintf(s->receiver, sizeof(s->receiver), "%s", w->config.machine_build[0] ? w->config.machine_build :
+		w->config.machine);
 	ui_header(&app.ui, app.demo ? "Demo mode" : "");  /* The receiver is in the summary. */
 	eth0_ipv4(s->address, sizeof(s->address));
+	return 1;
+}
 
-	step(STEP_WELCOME);
-	if (!app.demo)
-		active = storage_is_expander_active(uuid, sizeof(uuid));
-	if (active && config.policy != MULTIBOOT_REQUIRED) {
-		int result = previous_setup();
-		if (result < 0)
-			return 2;
-		if (result == 0) {
-			active = 0;
-			uuid[0] = '\0';
-		} else {
-			snprintf(s->mode, sizeof(s->mode), "FlashExpander");
-			snprintf(s->usb, sizeof(s->usb), "Prepared earlier");
-		}
+/* An earlier run prepared the USB storage: 1 to keep it, 0 to set it up again, -1 to stop. */
+static int earlier_storage(struct wizard *w)
+{
+	int result;
+	if (app.demo || !storage_is_expander_active(w->uuid, sizeof(w->uuid)))
+		return 0;
+	if (w->config.policy == MULTIBOOT_REQUIRED)
+		return 0;
+	result = previous_setup();
+	if (result == 1) {
+		snprintf(app.setup.mode, sizeof(app.setup.mode), "FlashExpander");
+		snprintf(app.setup.usb, sizeof(app.setup.usb), "Prepared earlier");
+	} else
+		w->uuid[0] = '\0';
+	return result;
+}
+
+/* The mode the configuration allows: 0 for FlashExpander, 1 for Chkroot, -1 for BACK. */
+static int choose_mode(const struct multiboot_config *config)
+{
+	if (config->policy == MULTIBOOT_OPTIONAL) {
+		const char *const modes[] = {"FlashExpander\t/usr on USB, the image stays in flash",
+			"Chkroot Multiboot\tThe whole image on USB, the kernel stays in flash"};
+		int choice = choose("How should the receiver use USB?",
+			"An SSD or a hard disk is faster than a cheap USB stick. With Chkroot the USB device must "
+			"stay connected.", NULL, modes, 2, 0, "Continue");
+		return choice < 0 ? -1 : choice == 1;
 	}
-	if (!active || config.policy == MULTIBOOT_REQUIRED) {
-		for (;;) {
-			step(STEP_WELCOME);
-			ui_keys(footer, sizeof(footer), &(struct ui_key_names){.ok = "Start setup"});
-			show("Welcome",
-				"This wizard prepares the receiver for its small flash and memory. It has to be completed before "
-				"Enigma2 can start.\n\nYou need a USB device, which will be erased, and a wired network with "
-				"internet access.\n\nINFO shows the version and the licenses.", footer, 0);
-			if (stop_requested)
-				return 2;
-
-			step(STEP_MODE);
-			if (config.policy == MULTIBOOT_OPTIONAL) {
-				const char *const modes[] = {"FlashExpander\t/usr on USB, the image stays in flash",
-					"Chkroot Multiboot\tThe whole image on USB, the kernel stays in flash"};
-				int choice = choose("How should the receiver use USB?",
-					"An SSD or a hard disk is faster than a cheap USB stick. With Chkroot the USB device must "
-					"stay connected.", NULL, modes, 2, 0, "Continue");
-				if (stop_requested)
-					return 2;
-				if (choice < 0)
-					continue;
-				chkroot = choice == 1;
-			} else if (config.policy == MULTIBOOT_REQUIRED) {
-				const char *const required[] = {"Chkroot Multiboot\tThe whole image on USB"};
-				int choice = choose("Chkroot is required",
-					"The flash of this receiver holds only the bootstrap and the shared kernel. The complete "
-					"Enigma2 root file system is installed on USB.", NULL, required, 1, 0, "Continue");
-				if (stop_requested)
-					return 2;
-				if (choice < 0)
-					continue;
-				chkroot = 1;
-			}
-			snprintf(s->mode, sizeof(s->mode), chkroot ? "Chkroot Multiboot" : "FlashExpander");
-
-			step(STEP_STORAGE);
-			if (configure_storage(&config, chkroot, uuid, sizeof(uuid), &layout))
-				break;
-			if (stop_requested)
-				return 2;
-			s->mode[0] = '\0';  /* BACK, to the welcome again. */
-		}
+	if (config->policy == MULTIBOOT_REQUIRED) {
+		const char *const required[] = {"Chkroot Multiboot\tThe whole image on USB"};
+		int choice = choose("Chkroot is required",
+			"The flash of this receiver holds only the bootstrap and the shared kernel. The complete "
+			"Enigma2 root file system is installed on USB.", NULL, required, 1, 0, "Continue");
+		return choice < 0 ? -1 : 1;
 	}
+	return 0;
+}
 
+/* Welcome, mode and USB storage until the storage is prepared, 0 to stop. */
+static int setup_storage(struct wizard *w)
+{
+	char footer[96];
+	ui_keys(footer, sizeof(footer), &(struct ui_key_names){.ok = "Start setup"});
+	for (;;) {
+		int mode;
+		step(STEP_WELCOME);
+		show("Welcome",
+			"This wizard prepares the receiver for its small flash and memory. It has to be completed before "
+			"Enigma2 can start.\n\nYou need a USB device, which will be erased, and a wired network with "
+			"internet access.\n\nINFO shows the version and the licenses.", footer, 0);
+		if (stop_requested)
+			return 0;
+		step(STEP_MODE);
+		mode = choose_mode(&w->config);
+		if (stop_requested)
+			return 0;
+		if (mode < 0)
+			continue;
+		w->chkroot = mode;
+		snprintf(app.setup.mode, sizeof(app.setup.mode), w->chkroot ? "Chkroot Multiboot" : "FlashExpander");
+		step(STEP_STORAGE);
+		if (configure_storage(&(struct storage_target){&w->config, w->chkroot, w->uuid, sizeof(w->uuid),
+			&w->layout}))
+			return 1;
+		if (stop_requested)
+			return 0;
+		app.setup.mode[0] = '\0';  /* BACK, to the welcome again. */
+	}
+}
+
+/* Sets the clock for the downloads, 1 when it is right. */
+static int set_clock(struct wizard *w)
+{
+	int result = 1;
+	app.busy = 1;
+	start_progress("Setting the clock");
+	if (app.demo) {
+		static const char *const statuses[] = {"Asking the time servers"};
+		demo_work(statuses, 1, 1500);
+	} else
+		result = network_synchronize_time(progress, NULL, w->error, sizeof(w->error));
+	app.busy = 0;
+	if (!result)
+		show_error("The clock could not be set", w->error);
+	return result;
+}
+
+/* Network, clock and installation until installed, 0 to stop. */
+static int network_and_install(struct wizard *w)
+{
 	for (;;) {
 		int result;
 		step(STEP_NETWORK);
-		if (!configure_network(interface, sizeof(interface), address, sizeof(address)))
-			return 2;
-		snprintf(s->network, sizeof(s->network), "%s, %s", interface, address);
-		app.busy = 1;
-		start_progress("Setting the clock");
-		if (app.demo) {
-			static const char *const statuses[] = {"Asking the time servers"};
-			demo_work(statuses, 1, 1500);
-		} else if (!network_synchronize_time(progress, NULL, error, sizeof(error))) {
-			app.busy = 0;
-			show_error("The clock could not be set", error);
-			continue;
-		}
-		app.busy = 0;
-		step(STEP_INSTALL);
-		result = install(&config, &layout, chkroot);
-		if (result == 1)
-			break;
-		if (result == 0)
-			return 2;
-		s->network[0] = '\0';
-	}
-
-	if (!app.demo && !chkroot) {
-		if (config.single_core && !network_disable_optional_services(progress, NULL, error, sizeof(error))) {
-			show_error("Single-core boot profile failed", error);
-			return 1;
-		}
-		if (!write_done_marker(uuid, interface, address, error, sizeof(error))) {
-			show_error("Completion failed", error);
-			return 1;
-		}
-	} else if (!app.demo)
-		write_reboot_marker();
-	sync();
-
-	step(STEP_DONE);
-	ui_keys(footer, sizeof(footer), &(struct ui_key_names){.ok = "Exit"});
-	{
-		const char *title = chkroot ? "Chkroot SmallBox is ready" : "SmallBox is ready";
-		const char *body = chkroot ?
-			"The complete Enigma2 root file system is installed in the verified USB slot. The internal kernel was "
-			"not flashed. The receiver restarts into Chkroot now.\n\n" KEEP_USB :
-			"FlashExpander, 512 MB swap, network and the SmallBox packages are ready. The receiver restarts now."
-			"\n\n" KEEP_USB;
-		if (app.no_reboot || app.demo) {
-			show(title, body, footer, 0);
+		if (!configure_network(w->interface, sizeof(w->interface), w->address, sizeof(w->address)))
 			return 0;
-		}
-		summary(1);
-		ui_screen(&app.ui, title, body, "Restarting...");
+		snprintf(app.setup.network, sizeof(app.setup.network), "%s, %s", w->interface, w->address);
+		if (!set_clock(w))
+			continue;
+		step(STEP_INSTALL);
+		result = install(&w->config, &w->layout, w->chkroot);
+		if (result >= 0)
+			return result;
+		app.setup.network[0] = '\0';
 	}
+}
+
+/* The markers that end the setup, 0 when they could not be written. */
+static int write_markers(struct wizard *w)
+{
+	if (app.demo)
+		return 1;
+	if (w->chkroot) {
+		write_reboot_marker();
+		return 1;
+	}
+	if (w->config.single_core && !network_disable_optional_services(progress, NULL, w->error, sizeof(w->error))) {
+		show_error("Single-core boot profile failed", w->error);
+		return 0;
+	}
+	if (!write_done_marker(w->uuid, w->interface, w->address, w->error, sizeof(w->error))) {
+		show_error("Completion failed", w->error);
+		return 0;
+	}
+	return 1;
+}
+
+static void reboot_receiver(void)
+{
+	char reboot_path[256];
+	if (process_find("reboot", reboot_path, sizeof(reboot_path))) {
+		char *argv[] = {reboot_path, NULL};
+		process_run(argv, NULL, NULL, NULL);
+	}
+}
+
+/* The last screen, then the restart unless in test or demo mode. */
+static void finish(int chkroot)
+{
+	char footer[96];
+	const char *title = chkroot ? "Chkroot SmallBox is ready" : "SmallBox is ready";
+	const char *body = chkroot ?
+		"The complete Enigma2 root file system is installed in the verified USB slot. The internal kernel was "
+		"not flashed. The receiver restarts into Chkroot now.\n\n" KEEP_USB :
+		"FlashExpander, 512 MB swap, network and the SmallBox packages are ready. The receiver restarts now."
+		"\n\n" KEEP_USB;
+	step(STEP_DONE);
+	if (app.no_reboot || app.demo) {
+		ui_keys(footer, sizeof(footer), &(struct ui_key_names){.ok = "Exit"});
+		show(title, body, footer, 0);
+		return;
+	}
+	summary(1);
+	ui_screen(&app.ui, title, body, "Restarting...");
 	sleep(2);
-	{
-		char reboot_path[256];
-		if (process_find("reboot", reboot_path, sizeof(reboot_path))) {
-			char *argv[] = {reboot_path, NULL};
-			process_run(argv, NULL, NULL, NULL);
-		}
-	}
+	reboot_receiver();
+}
+
+static int run_wizard(void)
+{
+	static struct wizard w;
+	int earlier;
+	if (!load_setup(&w))
+		return 1;
+	step(STEP_WELCOME);
+	earlier = earlier_storage(&w);
+	if (earlier < 0)
+		return 2;
+	if (!earlier && !setup_storage(&w))
+		return 2;
+	if (!network_and_install(&w))
+		return 2;
+	if (!write_markers(&w))
+		return 1;
+	sync();
+	finish(w.chkroot);
 	return 0;
 }
 

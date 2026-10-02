@@ -51,7 +51,7 @@ int multiboot_prepare(const struct storage_device *device,
 	void *opaque, struct multiboot_layout *layout, char *error,
 	size_t error_size);
 int multiboot_install(const struct multiboot_config *config,
-	struct multiboot_layout *layout, multiboot_progress_cb callback,
+	const struct multiboot_layout *layout, multiboot_progress_cb callback,
 	multiboot_display_clear_cb clear_display, void *opaque, char *error,
 	size_t error_size);
 int multiboot_detect_active_slot(const struct multiboot_layout *layout,

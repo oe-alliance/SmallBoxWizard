@@ -7,6 +7,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <linux/fs.h>
 #include <stdarg.h>
@@ -18,6 +19,7 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #define EXPANDER_MOUNT "/.FlashExpander"
@@ -30,23 +32,32 @@
 #define SWAP_BYTES (512ULL * 1024ULL * 1024ULL)
 #define MIN_DATA_BYTES (512ULL * 1024ULL * 1024ULL)
 
-static void set_error(char *error, size_t error_size, const char *format, ...)
+__attribute__((format(printf, 3, 4)))
+static void set_error(char *error, size_t error_size, const char *format, ...)  /* NOSONAR printf-style helper */
 {
 	va_list arguments;
 	if (!error || error_size == 0)
 		return;
 	va_start(arguments, format);
-	vsnprintf(error, error_size, format, arguments);
+	vsnprintf(error, error_size, format, arguments);  /* NOSONAR format checked by attribute */
 	va_end(arguments);
+}
+
+static void sleep_ms(long milliseconds)
+{
+	struct timespec delay;
+	delay.tv_sec = milliseconds / 1000L;
+	delay.tv_nsec = (milliseconds % 1000L) * 1000000L;
+	nanosleep(&delay, NULL);
 }
 
 static void trim(char *text)
 {
 	size_t length;
-	char *start = text;
+	const char *start = text;
 	if (!text)
 		return;
-	while (*start && isspace((unsigned char)*start))
+	while (*start && isspace((unsigned char)*start))  /* NOSONAR stops at the terminator */
 		start++;
 	if (start != text)
 		memmove(text, start, strlen(start) + 1);
@@ -75,11 +86,10 @@ static int read_text(const char *path, char *text, size_t text_size)
 
 static int is_disk_name(const char *name)
 {
-	const char *cursor;
 	if (!name || name[0] != 's' || name[1] != 'd' ||
 		!isalpha((unsigned char)name[2]))
 		return 0;
-	for (cursor = name + 2; *cursor; ++cursor) {
+	for (const char *cursor = name + 2; *cursor; ++cursor) {
 		if (!isalpha((unsigned char)*cursor))
 			return 0;
 	}
@@ -136,8 +146,7 @@ static void read_critical_devices(struct dev_numbers *numbers)
 
 static int matches_critical(const char *dev, const struct dev_numbers *numbers)
 {
-	int i;
-	for (i = 0; i < numbers->count; ++i) {
+	for (int i = 0; i < numbers->count; ++i) {
 		if (strcmp(dev, numbers->values[i]) == 0)
 			return 1;
 	}
@@ -285,12 +294,13 @@ const char *storage_expander_mount(void)
 
 static int read_meta_value(const char *key, char *value, size_t value_size)
 {
-	FILE *file = fopen(EXPANDER_META, "r");
+	FILE *file;
 	char line[256];
 	size_t key_length;
 	if (!key || !value || value_size == 0)
 		return 0;
 	value[0] = '\0';
+	file = fopen(EXPANDER_META, "r");
 	if (!file)
 		return 0;
 	key_length = strlen(key);
@@ -351,22 +361,44 @@ static void partition_path(const struct storage_device *device, int number,
 {
 	size_t length = strlen(device->name);
 	snprintf(path, path_size, "/dev/%s%s%d", device->name,
-		length && isdigit((unsigned char)device->name[length - 1]) ? "p" : "",
+		length && isdigit((unsigned char)device->name[length - 1]) ? "p" : "",  /* NOSONAR length >= 1 here */
 		number);
 }
 
 static int source_is_partition(const char *source, const char *device_path)
 {
 	size_t length = strlen(device_path);
+	char next;
 	if (strncmp(source, device_path, length) != 0)
 		return 0;
-	return source[length] == '\0' || isdigit((unsigned char)source[length]) ||
-		source[length] == 'p';
+	next = source[length];  /* NOSONAR prefix matched, index <= strlen(source) */
+	return next == '\0' || isdigit((unsigned char)next) || next == 'p';  /* NOSONAR the character read above */
 }
 
 static void run_quiet(char *const argv[])
 {
 	process_run(argv, NULL, NULL, NULL);
+}
+
+static void swapoff_target(const struct storage_device *device)
+{
+	FILE *file;
+	char line[1024];
+
+	file = fopen("/proc/swaps", "r");
+	if (!file)
+		return;
+	if (fgets(line, sizeof(line), file)) {
+		while (fgets(line, sizeof(line), file)) {
+			char source[PATH_MAX];
+			if (sscanf(line, "%4095s", source) == 1 &&
+				source_is_partition(source, device->path)) {
+				char *argv[] = {"swapoff", source, NULL};
+				run_quiet(argv);
+			}
+		}
+	}
+	fclose(file);
 }
 
 static int deactivate_target(const struct storage_device *device,
@@ -376,22 +408,8 @@ static int deactivate_target(const struct storage_device *device,
 	char line[1024];
 	char sources[32][PATH_MAX];
 	int count = 0;
-	int i;
 
-	file = fopen("/proc/swaps", "r");
-	if (file) {
-		if (fgets(line, sizeof(line), file)) {
-			while (fgets(line, sizeof(line), file)) {
-				char source[PATH_MAX];
-				if (sscanf(line, "%4095s", source) == 1 &&
-					source_is_partition(source, device->path)) {
-					char *argv[] = {"swapoff", source, NULL};
-					run_quiet(argv);
-				}
-			}
-		}
-		fclose(file);
-	}
+	swapoff_target(device);
 	file = fopen("/proc/mounts", "r");
 	if (!file)
 		return 1;
@@ -411,7 +429,7 @@ static int deactivate_target(const struct storage_device *device,
 		snprintf(sources[count++], sizeof(sources[0]), "%s", mountpoint);
 	}
 	fclose(file);
-	for (i = count - 1; i >= 0; --i) {
+	for (int i = count - 1; i >= 0; --i) {
 		char *argv[] = {"umount", sources[i], NULL};
 		if (process_run(argv, NULL, NULL, NULL) != 0) {
 			set_error(error, error_size, "A mount point could not be unmounted: %s",
@@ -427,9 +445,8 @@ static int validate_selected(const struct storage_device *selected)
 	struct storage_device devices[STORAGE_MAX_DEVICES];
 	char error[128];
 	int count;
-	int i;
 	count = storage_scan_usb(devices, STORAGE_MAX_DEVICES, error, sizeof(error));
-	for (i = 0; i < count; ++i) {
+	for (int i = 0; i < count; ++i) {
 		if (strcmp(devices[i].path, selected->path) == 0 &&
 			devices[i].size_bytes == selected->size_bytes)
 			return 1;
@@ -439,14 +456,13 @@ static int validate_selected(const struct storage_device *selected)
 
 static int wait_for_partitions(const char *part1, const char *part2)
 {
-	int attempt;
 	struct stat status1;
 	struct stat status2;
-	for (attempt = 0; attempt < 100; ++attempt) {
+	for (int attempt = 0; attempt < 100; ++attempt) {
 		if (stat(part1, &status1) == 0 && S_ISBLK(status1.st_mode) &&
 			stat(part2, &status2) == 0 && S_ISBLK(status2.st_mode))
 			return 1;
-		usleep(100000);
+		sleep_ms(100);
 	}
 	return 0;
 }
@@ -467,7 +483,7 @@ static int create_nomount_flag(const struct storage_device *device,
 	if (snprintf(path, path_size, "/dev/nomount.%s", device->name) >=
 		(int)path_size)
 		return 0;
-	fd = open(path, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+	fd = open(path, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);  /* NOSONAR /dev/nomount.<sysfs disk name> */
 	if (fd < 0)
 		return 0;
 	close(fd);
@@ -477,8 +493,10 @@ static int create_nomount_flag(const struct storage_device *device,
 static int blkid_uuid(const char *partition, char *uuid, size_t uuid_size)
 {
 	char blkid[PATH_MAX];
-	char *argv[] = {blkid, "-s", "UUID", "-o", "value",
-		(char *)partition, NULL};
+	char target[PATH_MAX];
+	char *argv[] = {blkid, "-s", "UUID", "-o", "value", target, NULL};
+	if (snprintf(target, sizeof(target), "%s", partition) >= (int)sizeof(target))
+		return 0;
 	if (!process_find("blkid", blkid, sizeof(blkid)))
 		return 0;
 	if (process_capture(argv, uuid, uuid_size) != 0)
@@ -494,6 +512,24 @@ static int copy_mode(const char *path, mode_t *mode)
 		return 0;
 	*mode = status.st_mode & 0777;
 	return 1;
+}
+
+/* Flush, sync, close and rename; the stream is always closed, errno kept. */
+static int commit_file(FILE *file, int fd, const char *temporary,
+	const char *target)
+{
+	int ok = fflush(file) == 0 && fsync(fd) == 0;
+	int saved_errno = errno;
+	if (fclose(file) != 0 && ok) {
+		ok = 0;
+		saved_errno = errno;
+	}
+	if (ok && rename(temporary, target) != 0) {
+		ok = 0;
+		saved_errno = errno;
+	}
+	errno = saved_errno;
+	return ok;
 }
 
 static int update_fstab(const char *data_uuid, const char *swap_uuid,
@@ -548,8 +584,7 @@ static int update_fstab(const char *data_uuid, const char *swap_uuid,
 		fprintf(output, "UUID=%s none swap sw 0 0\n", swap_uuid);
 		fprintf(output, "%s\n", FSTAB_END);
 	}
-	if (fflush(output) != 0 || fsync(fd) != 0 || fclose(output) != 0 ||
-		rename(temporary, "/etc/fstab") != 0) {
+	if (!commit_file(output, fd, temporary, "/etc/fstab")) {
 		set_error(error, error_size, "fstab could not be saved: %s",
 			strerror(errno));
 		unlink(temporary);
@@ -600,7 +635,9 @@ static void restore_expander(const char *swap_source, int data_unmounted)
 		run_quiet(mount_usr);
 	}
 	if (swap_source && swap_source[0]) {
-		char *swapon[] = {"swapon", (char *)swap_source, NULL};
+		char source[PATH_MAX];
+		char *swapon[] = {"swapon", source, NULL};
+		snprintf(source, sizeof(source), "%s", swap_source);
 		run_quiet(swapon);
 	}
 }
@@ -680,8 +717,7 @@ static int write_metadata(const char *data_uuid, const char *swap_uuid)
 	}
 	fprintf(file, "version=1\nuuid=%s\nswap_uuid=%s\n", data_uuid,
 		swap_uuid);
-	if (fflush(file) != 0 || fsync(fd) != 0 || fclose(file) != 0 ||
-		rename(temporary, EXPANDER_META_REL) != 0) {
+	if (!commit_file(file, fd, temporary, EXPANDER_META_REL)) {
 		unlink(temporary);
 		return 0;
 	}
@@ -711,10 +747,12 @@ static uint64_t directory_allocated_bytes(const char *path)
 {
 	char du[PATH_MAX];
 	char output[128];
+	char target[PATH_MAX];
 	char *end;
 	unsigned long long kibibytes;
-	char *argv[] = {du, "-sk", (char *)path, NULL};
-	if (!process_find("du", du, sizeof(du)) ||
+	char *argv[] = {du, "-sk", target, NULL};
+	if (snprintf(target, sizeof(target), "%s", path) >= (int)sizeof(target) ||
+		!process_find("du", du, sizeof(du)) ||
 		process_capture(argv, output, sizeof(output)) != 0)
 		return 0;
 	errno = 0;
@@ -756,9 +794,9 @@ static void copy_tick(void *opaque)
 		overall_percent = 69;
 	if (state->total_bytes)
 		snprintf(status, sizeof(status),
-			"Copying /usr to USB: %u%% (%llu / %llu MiB, %u s)",
-			copy_percent, (unsigned long long)(copied / 1024ULL / 1024ULL),
-			(unsigned long long)(state->total_bytes / 1024ULL / 1024ULL),
+			"Copying /usr to USB: %u%% (%" PRIu64 " / %" PRIu64 " MiB, %u s)",
+			copy_percent, copied / (1024U * 1024U),
+			state->total_bytes / (1024U * 1024U),
 			state->elapsed_seconds);
 	else
 		snprintf(status, sizeof(status), "Copying /usr to USB... %u s elapsed",
@@ -774,33 +812,325 @@ static void progress(storage_progress_cb callback, void *opaque, int percent,
 		callback(percent, status, opaque);
 }
 
+struct prepare_state {
+	const struct storage_device *device;
+	storage_progress_cb callback;
+	void *opaque;
+	char *error;
+	size_t error_size;
+	int disk_fd;
+	char part1[64];
+	char part2[64];
+	char data_uuid[128];
+	char swap_uuid[128];
+	int mounted;
+	int mount_locked;
+	int bound;
+	int swap_active;
+	int fstab_written;
+};
+
+struct partition_layout {
+	uint64_t first_start;
+	uint64_t first_size;
+	uint64_t swap_start;
+	uint64_t swap_sectors;
+};
+
+static int open_target_disk(struct prepare_state *state, uint64_t *bytes,
+	unsigned int *sector_size)
+{
+	const struct storage_device *device = state->device;
+	state->disk_fd = open(device->path, O_RDONLY | O_CLOEXEC);  /* NOSONAR the USB device the user chose */
+	if (state->disk_fd < 0 || ioctl(state->disk_fd, BLKGETSIZE64, bytes) < 0) {
+		set_error(state->error, state->error_size,
+			"The size of %s cannot be read: %s", device->path, strerror(errno));
+		return 0;
+	}
+	if (ioctl(state->disk_fd, BLKSSZGET, sector_size) < 0)
+		*sector_size = 512;
+	if (*bytes != device->size_bytes || *sector_size == 0 ||
+		*bytes < SWAP_BYTES + MIN_DATA_BYTES) {
+		set_error(state->error, state->error_size,
+			"The USB device size has changed.");
+		return 0;
+	}
+	return 1;
+}
+
+static int compute_layout(struct prepare_state *state, uint64_t bytes,
+	unsigned int sector_size, struct partition_layout *layout)
+{
+	uint64_t total_sectors = bytes / sector_size;
+	uint64_t alignment;
+	if (total_sectors > 0xffffffffULL) {
+		set_error(state->error, state->error_size,
+			"USB devices larger than 2 TB are not supported by this version.");
+		return 0;
+	}
+	alignment = 1024ULL * 1024ULL / sector_size;
+	if (alignment == 0) alignment = 1;
+	layout->first_start = alignment;
+	layout->swap_sectors = SWAP_BYTES / sector_size;
+	layout->swap_start = ((total_sectors - layout->swap_sectors) / alignment) *
+		alignment;
+	layout->first_size = layout->swap_start - layout->first_start;
+	if (layout->first_size * sector_size < MIN_DATA_BYTES) {
+		set_error(state->error, state->error_size, "The USB device is too small.");
+		return 0;
+	}
+	return 1;
+}
+
+static int partition_disk(struct prepare_state *state)
+{
+	const struct storage_device *device = state->device;
+	uint64_t bytes = 0;
+	unsigned int sector_size = 512;
+	struct partition_layout layout;
+	char script[512];
+	char sfdisk[PATH_MAX];
+	char disk_path[sizeof(device->path)];
+	char *argv[] = {sfdisk, "--wipe", "always", "--wipe-partitions",
+		"always", disk_path, NULL};
+
+	if (!open_target_disk(state, &bytes, &sector_size) ||
+		!compute_layout(state, bytes, sector_size, &layout))
+		return 0;
+	partition_path(device, 1, state->part1, sizeof(state->part1));
+	partition_path(device, 2, state->part2, sizeof(state->part2));
+	snprintf(script, sizeof(script),
+		"label: dos\nunit: sectors\n%s : start=%llu, size=%llu, type=83\n"
+		"%s : start=%llu, size=%llu, type=82\n",
+		state->part1, (unsigned long long)layout.first_start,
+		(unsigned long long)layout.first_size, state->part2,
+		(unsigned long long)layout.swap_start,
+		(unsigned long long)layout.swap_sectors);
+	if (!process_find("sfdisk", sfdisk, sizeof(sfdisk))) {
+		set_error(state->error, state->error_size,
+			"sfdisk is not installed in this image.");
+		return 0;
+	}
+	progress(state->callback, state->opaque, 10,
+		"Creating a new partition table...");
+	snprintf(disk_path, sizeof(disk_path), "%s", device->path);
+	if (process_run(argv, script, NULL, NULL) != 0) {
+		set_error(state->error, state->error_size, "Partitioning %s failed.",
+			device->path);
+		return 0;
+	}
+	ioctl(state->disk_fd, BLKRRPART);
+	close(state->disk_fd);
+	state->disk_fd = -1;
+	if (!wait_for_partitions(state->part1, state->part2)) {
+		set_error(state->error, state->error_size,
+			"The new partitions did not appear in the system.");
+		return 0;
+	}
+	return 1;
+}
+
+static int format_partitions(struct prepare_state *state)
+{
+	char mkfs[PATH_MAX];
+	char mkswap[PATH_MAX];
+	char *mkfs_argv[] = {mkfs, "-F", "-t", "ext4", "-L",
+		"FLASH_EXPANDER", "-m", "0", state->part1, NULL};
+	char *mkswap_argv[] = {mkswap, "-L", "SMALLBOX_SWAP", state->part2, NULL};
+
+	if (!process_find("mkfs.ext4", mkfs, sizeof(mkfs)) &&
+		!process_find("mke2fs", mkfs, sizeof(mkfs))) {
+		set_error(state->error, state->error_size,
+			"mkfs.ext4 is not installed in this image.");
+		return 0;
+	}
+	progress(state->callback, state->opaque, 22,
+		"Formatting the FlashExpander as ext4...");
+	if (process_run(mkfs_argv, NULL, NULL, NULL) != 0) {
+		set_error(state->error, state->error_size,
+			"Formatting the ext4 partition failed.");
+		return 0;
+	}
+	if (!process_find("mkswap", mkswap, sizeof(mkswap))) {
+		set_error(state->error, state->error_size,
+			"mkswap is not installed in this image.");
+		return 0;
+	}
+	progress(state->callback, state->opaque, 32,
+		"Creating the 512 MB swap partition...");
+	if (process_run(mkswap_argv, NULL, NULL, NULL) != 0) {
+		set_error(state->error, state->error_size,
+			"Formatting the swap partition failed.");
+		return 0;
+	}
+	return 1;
+}
+
+static int mount_expander(struct prepare_state *state)
+{
+	char *mount_argv[] = {"mount", "-t", "ext4", "-o", "noatime",
+		state->part1, EXPANDER_MOUNT, NULL};
+	char *swapon_argv[] = {"swapon", state->part2, NULL};
+
+	/* Drain any event which entered mount.sh just before the nomount flag. */
+	sleep_ms(500);
+	if (!deactivate_target(state->device, state->error, state->error_size))
+		return 0;
+	if (!make_directory(EXPANDER_MOUNT, 0755)) {
+		set_error(state->error, state->error_size,
+			"The mount directory cannot be created.");
+		return 0;
+	}
+	if (process_run(mount_argv, NULL, NULL, NULL) != 0) {
+		set_error(state->error, state->error_size,
+			"The FlashExpander cannot be mounted.");
+		return 0;
+	}
+	state->mounted = 1;
+	/*
+	 * Keep our current directory inside the filesystem while copying.  A
+	 * traditional automounter can no longer unmount it, and relative paths
+	 * remain on the USB filesystem even if an old lazy-unmount script races
+	 * us.  This also prevents a copy from ever falling through into flash.
+	 */
+	if (chdir(EXPANDER_MOUNT) != 0) {
+		set_error(state->error, state->error_size,
+			"The FlashExpander mount cannot be locked: %s", strerror(errno));
+		return 0;
+	}
+	state->mount_locked = 1;
+	progress(state->callback, state->opaque, 38,
+		"Activating 512 MB swap before copying /usr...");
+	if (process_run(swapon_argv, NULL, NULL, NULL) != 0) {
+		set_error(state->error, state->error_size,
+			"Swap could not be activated.");
+		return 0;
+	}
+	state->swap_active = 1;
+	return 1;
+}
+
+static int copy_usr(struct prepare_state *state)
+{
+	struct copy_state copy;
+	char *argv[] = {"cp", "-a", "/usr/.", EXPANDER_USR_REL, NULL};
+
+	if (!make_directory(EXPANDER_USR_REL, 0755)) {
+		set_error(state->error, state->error_size,
+			"The destination for /usr cannot be created.");
+		return 0;
+	}
+	progress(state->callback, state->opaque, 42,
+		"Copying the complete /usr tree. Do not remove the USB device!");
+	memset(&copy, 0, sizeof(copy));
+	copy.callback = state->callback;
+	copy.opaque = state->opaque;
+	copy.total_bytes = directory_allocated_bytes("/usr");
+	copy.initial_free_bytes = filesystem_free_bytes(".");
+	if (process_run_with_updates(argv, NULL, copy_line, copy_tick, 1000,
+		&copy) != 0) {
+		if (copy.error_line[0])
+			set_error(state->error, state->error_size,
+				"Copying /usr failed: %s", copy.error_line);
+		else
+			set_error(state->error, state->error_size, "Copying /usr failed.");
+		return 0;
+	}
+	sync();
+	progress(state->callback, state->opaque, 70,
+		"Copying /usr to USB: 100% complete.");
+	if (access(EXPANDER_USR_REL "/bin", F_OK) != 0) {
+		set_error(state->error, state->error_size,
+			"The copied /usr tree is incomplete.");
+		return 0;
+	}
+	return 1;
+}
+
+static int switch_usr(struct prepare_state *state)
+{
+	char *bind_argv[] = {"mount", "--bind", EXPANDER_USR, "/usr", NULL};
+	struct stat source_status;
+	struct stat target_status;
+
+	progress(state->callback, state->opaque, 72,
+		"Configuring UUIDs and persistent mounts...");
+	if (!blkid_uuid(state->part1, state->data_uuid, sizeof(state->data_uuid)) ||
+		!blkid_uuid(state->part2, state->swap_uuid, sizeof(state->swap_uuid))) {
+		set_error(state->error, state->error_size,
+			"The partition UUIDs cannot be read.");
+		return 0;
+	}
+	if (!write_metadata(state->data_uuid, state->swap_uuid)) {
+		set_error(state->error, state->error_size,
+			"The FlashExpander metadata could not be saved.");
+		return 0;
+	}
+	if (!update_fstab(state->data_uuid, state->swap_uuid, 1, state->error,
+		state->error_size))
+		return 0;
+	state->fstab_written = 1;
+	progress(state->callback, state->opaque, 82,
+		"Switching /usr live to the USB device...");
+	if (process_run(bind_argv, NULL, NULL, NULL) != 0) {
+		set_error(state->error, state->error_size,
+			"The bind mount for /usr failed.");
+		return 0;
+	}
+	state->bound = 1;
+	if (stat(EXPANDER_USR, &source_status) < 0 ||
+		stat("/usr", &target_status) < 0 ||
+		source_status.st_dev != target_status.st_dev) {
+		set_error(state->error, state->error_size,
+			"The /usr switch could not be verified.");
+		return 0;
+	}
+	return 1;
+}
+
+static int release_working_directory(struct prepare_state *state)
+{
+	progress(state->callback, state->opaque, 92,
+		"Verifying the active 512 MB swap...");
+	sync();
+	if (state->mount_locked) {
+		if (chdir("/") < 0) {
+			set_error(state->error, state->error_size,
+				"The USB working directory cannot be released: %s",
+				strerror(errno));
+			return 0;
+		}
+		state->mount_locked = 0;
+	}
+	return 1;
+}
+
+static void prepare_cleanup(struct prepare_state *state)
+{
+	char *swapoff_argv[] = {"swapoff", state->part2, NULL};
+	char *umount_usr_argv[] = {"umount", "/usr", NULL};
+	char *umount_data_argv[] = {"umount", EXPANDER_MOUNT, NULL};
+
+	if (state->disk_fd >= 0)
+		close(state->disk_fd);
+	if (state->fstab_written)
+		update_fstab(NULL, NULL, 0, NULL, 0);
+	if (state->swap_active)
+		run_quiet(swapoff_argv);
+	if (state->bound)
+		run_quiet(umount_usr_argv);
+	if (state->mount_locked && chdir("/") == 0)
+		state->mount_locked = 0;
+	if (state->mounted)
+		run_quiet(umount_data_argv);
+}
+
 int storage_prepare(const struct storage_device *device,
 	storage_progress_cb callback, void *opaque, char *uuid,
 	size_t uuid_size, char *error, size_t error_size)
 {
-	int disk_fd = -1;
-	uint64_t bytes = 0;
-	unsigned int sector_size = 512;
-	uint64_t total_sectors;
-	uint64_t alignment;
-	uint64_t first_start;
-	uint64_t swap_sectors;
-	uint64_t swap_start;
-	uint64_t first_size;
-	char part1[64];
-	char part2[64];
-	char script[512];
-	char sfdisk[PATH_MAX];
-	char mkfs[PATH_MAX];
-	char mkswap[PATH_MAX];
+	struct prepare_state state;
 	char nomount_flag[PATH_MAX];
-	char data_uuid[128];
-	char swap_uuid[128];
-	int mounted = 0;
-	int mount_locked = 0;
-	int bound = 0;
-	int swap_active = 0;
-	int fstab_written = 0;
 
 	if (uuid && uuid_size) uuid[0] = '\0';
 	if (error && error_size) error[0] = '\0';
@@ -819,229 +1149,21 @@ int storage_prepare(const struct storage_device *device,
 	progress(callback, opaque, 3, "Preparing the USB device for exclusive use...");
 	if (!deactivate_target(device, error, error_size))
 		return 0;
-	disk_fd = open(device->path, O_RDONLY | O_CLOEXEC);
-	if (disk_fd < 0 || ioctl(disk_fd, BLKGETSIZE64, &bytes) < 0) {
-		set_error(error, error_size, "The size of %s cannot be read: %s",
-			device->path, strerror(errno));
-		goto failed;
-	}
-	if (ioctl(disk_fd, BLKSSZGET, &sector_size) < 0)
-		sector_size = 512;
-	if (bytes != device->size_bytes || sector_size == 0 ||
-		bytes < SWAP_BYTES + MIN_DATA_BYTES) {
-		set_error(error, error_size, "The USB device size has changed.");
-		goto failed;
-	}
-	total_sectors = bytes / sector_size;
-	if (total_sectors > 0xffffffffULL) {
-		set_error(error, error_size,
-			"USB devices larger than 2 TB are not supported by this version.");
-		goto failed;
-	}
-	alignment = 1024ULL * 1024ULL / sector_size;
-	if (alignment == 0) alignment = 1;
-	first_start = alignment;
-	swap_sectors = SWAP_BYTES / sector_size;
-	swap_start = ((total_sectors - swap_sectors) / alignment) * alignment;
-	first_size = swap_start - first_start;
-	if (first_size * sector_size < MIN_DATA_BYTES) {
-		set_error(error, error_size, "The USB device is too small.");
-		goto failed;
-	}
-	partition_path(device, 1, part1, sizeof(part1));
-	partition_path(device, 2, part2, sizeof(part2));
-	snprintf(script, sizeof(script),
-		"label: dos\nunit: sectors\n%s : start=%llu, size=%llu, type=83\n"
-		"%s : start=%llu, size=%llu, type=82\n",
-		part1, (unsigned long long)first_start,
-		(unsigned long long)first_size, part2,
-		(unsigned long long)swap_start,
-		(unsigned long long)swap_sectors);
-	if (!process_find("sfdisk", sfdisk, sizeof(sfdisk))) {
-		set_error(error, error_size, "sfdisk is not installed in this image.");
-		goto failed;
-	}
-	progress(callback, opaque, 10, "Creating a new partition table...");
-	{
-		char *argv[] = {sfdisk, "--wipe", "always", "--wipe-partitions",
-			"always", (char *)device->path, NULL};
-		if (process_run(argv, script, NULL, NULL) != 0) {
-			set_error(error, error_size, "Partitioning %s failed.",
-				device->path);
-			goto failed;
-		}
-	}
-	ioctl(disk_fd, BLKRRPART);
-	close(disk_fd);
-	disk_fd = -1;
-	if (!wait_for_partitions(part1, part2)) {
-		set_error(error, error_size,
-			"The new partitions did not appear in the system.");
-		goto failed;
-	}
-	if (!process_find("mkfs.ext4", mkfs, sizeof(mkfs)) &&
-		!process_find("mke2fs", mkfs, sizeof(mkfs))) {
-		set_error(error, error_size, "mkfs.ext4 is not installed in this image.");
-		goto failed;
-	}
-	progress(callback, opaque, 22, "Formatting the FlashExpander as ext4...");
-	{
-		char *argv[] = {mkfs, "-F", "-t", "ext4", "-L",
-			"FLASH_EXPANDER", "-m", "0", part1, NULL};
-		if (process_run(argv, NULL, NULL, NULL) != 0) {
-			set_error(error, error_size, "Formatting the ext4 partition failed.");
-			goto failed;
-		}
-	}
-	if (!process_find("mkswap", mkswap, sizeof(mkswap))) {
-		set_error(error, error_size, "mkswap is not installed in this image.");
-		goto failed;
-	}
-	progress(callback, opaque, 32, "Creating the 512 MB swap partition...");
-	{
-		char *argv[] = {mkswap, "-L", "SMALLBOX_SWAP", part2, NULL};
-		if (process_run(argv, NULL, NULL, NULL) != 0) {
-			set_error(error, error_size, "Formatting the swap partition failed.");
-			goto failed;
-		}
-	}
-	/* Drain any event which entered mount.sh just before the nomount flag. */
-	usleep(500000);
-	if (!deactivate_target(device, error, error_size))
-		goto failed;
-	if (!make_directory(EXPANDER_MOUNT, 0755)) {
-		set_error(error, error_size, "The mount directory cannot be created.");
-		goto failed;
-	}
-	{
-		char *argv[] = {"mount", "-t", "ext4", "-o", "noatime",
-			part1, EXPANDER_MOUNT, NULL};
-		if (process_run(argv, NULL, NULL, NULL) != 0) {
-			set_error(error, error_size, "The FlashExpander cannot be mounted.");
-			goto failed;
-		}
-	}
-	mounted = 1;
-	/*
-	 * Keep our current directory inside the filesystem while copying.  A
-	 * traditional automounter can no longer unmount it, and relative paths
-	 * remain on the USB filesystem even if an old lazy-unmount script races
-	 * us.  This also prevents a copy from ever falling through into flash.
-	 */
-	if (chdir(EXPANDER_MOUNT) != 0) {
-		set_error(error, error_size,
-			"The FlashExpander mount cannot be locked: %s", strerror(errno));
-		goto failed;
-	}
-	mount_locked = 1;
-	progress(callback, opaque, 38,
-		"Activating 512 MB swap before copying /usr...");
-	{
-		char *argv[] = {"swapon", part2, NULL};
-		if (process_run(argv, NULL, NULL, NULL) != 0) {
-			set_error(error, error_size, "Swap could not be activated.");
-			goto failed;
-		}
-	}
-	swap_active = 1;
-	if (!make_directory(EXPANDER_USR_REL, 0755)) {
-		set_error(error, error_size, "The destination for /usr cannot be created.");
-		goto failed;
-	}
-	progress(callback, opaque, 42,
-		"Copying the complete /usr tree. Do not remove the USB device!");
-	{
-		struct copy_state state;
-		char *argv[] = {"cp", "-a", "/usr/.", EXPANDER_USR_REL, NULL};
-		memset(&state, 0, sizeof(state));
-		state.callback = callback;
-		state.opaque = opaque;
-		state.total_bytes = directory_allocated_bytes("/usr");
-		state.initial_free_bytes = filesystem_free_bytes(".");
-		if (process_run_with_updates(argv, NULL, copy_line, copy_tick, 1000,
-			&state) != 0) {
-			if (state.error_line[0])
-				set_error(error, error_size, "Copying /usr failed: %s",
-					state.error_line);
-			else
-				set_error(error, error_size, "Copying /usr failed.");
-			goto failed;
-		}
-	}
-	sync();
-	progress(callback, opaque, 70, "Copying /usr to USB: 100% complete.");
-	if (access(EXPANDER_USR_REL "/bin", F_OK) != 0) {
-		set_error(error, error_size, "The copied /usr tree is incomplete.");
-		goto failed;
-	}
-	progress(callback, opaque, 72, "Configuring UUIDs and persistent mounts...");
-	if (!blkid_uuid(part1, data_uuid, sizeof(data_uuid)) ||
-		!blkid_uuid(part2, swap_uuid, sizeof(swap_uuid))) {
-		set_error(error, error_size, "The partition UUIDs cannot be read.");
-		goto failed;
-	}
-	if (!write_metadata(data_uuid, swap_uuid)) {
-		set_error(error, error_size, "The FlashExpander metadata could not be saved.");
-		goto failed;
-	}
-	if (!update_fstab(data_uuid, swap_uuid, 1, error, error_size))
-		goto failed;
-	fstab_written = 1;
-	progress(callback, opaque, 82, "Switching /usr live to the USB device...");
-	{
-		char *argv[] = {"mount", "--bind", EXPANDER_USR, "/usr", NULL};
-		if (process_run(argv, NULL, NULL, NULL) != 0) {
-			set_error(error, error_size, "The bind mount for /usr failed.");
-			goto failed;
-		}
-	}
-	bound = 1;
-	{
-		struct stat source_status;
-		struct stat target_status;
-		if (stat(EXPANDER_USR, &source_status) < 0 ||
-			stat("/usr", &target_status) < 0 ||
-			source_status.st_dev != target_status.st_dev) {
-			set_error(error, error_size, "The /usr switch could not be verified.");
-			goto failed;
-		}
-	}
-	progress(callback, opaque, 92, "Verifying the active 512 MB swap...");
-	sync();
-	if (mount_locked) {
-		if (chdir("/") < 0) {
-			set_error(error, error_size,
-				"The USB working directory cannot be released: %s",
-				strerror(errno));
-			goto failed;
-		}
-		mount_locked = 0;
+	memset(&state, 0, sizeof(state));
+	state.device = device;
+	state.callback = callback;
+	state.opaque = opaque;
+	state.error = error;
+	state.error_size = error_size;
+	state.disk_fd = -1;
+	if (!partition_disk(&state) || !format_partitions(&state) ||
+		!mount_expander(&state) || !copy_usr(&state) ||
+		!switch_usr(&state) || !release_working_directory(&state)) {
+		prepare_cleanup(&state);
+		return 0;
 	}
 	progress(callback, opaque, 100, "FlashExpander and swap are active.");
 	if (uuid && uuid_size)
-		snprintf(uuid, uuid_size, "%s", data_uuid);
+		snprintf(uuid, uuid_size, "%s", state.data_uuid);
 	return 1;
-
-failed:
-	if (disk_fd >= 0)
-		close(disk_fd);
-	if (fstab_written)
-		update_fstab(NULL, NULL, 0, NULL, 0);
-	if (swap_active) {
-		char *argv[] = {"swapoff", part2, NULL};
-		run_quiet(argv);
-	}
-	if (bound) {
-		char *argv[] = {"umount", "/usr", NULL};
-		run_quiet(argv);
-	}
-	if (mount_locked) {
-		if (chdir("/") == 0)
-			mount_locked = 0;
-	}
-	if (mounted) {
-		char *argv[] = {"umount", EXPANDER_MOUNT, NULL};
-		run_quiet(argv);
-	}
-	return 0;
 }
