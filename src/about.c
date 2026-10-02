@@ -81,7 +81,7 @@ void about(const struct ui_context *ui, struct input_context *input, const volat
 			items[i] = rows[i];
 		}
 		snprintf(body, sizeof(body), "OE-Alliance SmallBox Wizard " SMALLBOX_WIZARD_VERSION "\n" COPYRIGHT
-			"\n\nFree software under the MIT license. OK shows the full license of each part.");
+			"\n\nFree software under the GPLv3. OK shows the full license of each part.");
 		snprintf(header, sizeof(header), wide ? "Component\tPart\tLicense" : "Component\tLicense");
 		ui_keys(footer, sizeof(footer), &(struct ui_key_names){.arrows = "Select", .ok = "License",
 			.back = "Back"});

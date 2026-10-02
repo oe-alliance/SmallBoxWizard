@@ -267,4 +267,14 @@ Enigma2 first, it needs the framebuffer.
 
 ## License
 
-SmallBox Wizard is licensed under the MIT License. See [`LICENSE`](LICENSE).
+Copyright (C) 2026 OpenATV SmallBox Wizard contributors
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, version 3, see [`LICENSE`](LICENSE).
+
+It contains, under their own licenses, which the About screen (INFO) shows:
+
+- LVGL (MIT, `lib/lvgl`).
+- The font, rendered from DejaVu Sans, and icons of Font Awesome Free
+  (SIL OFL 1.1), see `tools/fonts`.

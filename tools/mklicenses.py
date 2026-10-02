@@ -8,7 +8,7 @@ from os.path import dirname, join
 ROOT = join(dirname(__file__), "..")
 # Name, what it is in the wizard, license, file with the full text.
 LICENSES = (
-	("OE-Alliance SmallBox Wizard", "this application", "MIT", "LICENSE"),
+	("OE-Alliance SmallBox Wizard", "this application", "GPL-3.0", "LICENSE"),
 	("LVGL 9.6.0", "the graphics library", "MIT", "lib/lvgl/LICENCE.txt"),
 	("DejaVu Sans 2.37", "the font", "Bitstream Vera, Arev", "tools/fonts/DejaVuSans-LICENSE.txt"),
 	("Font Awesome 7.3.1 Free", "the icons", "SIL OFL 1.1", "tools/fonts/fontawesome/LICENSE.txt"),
