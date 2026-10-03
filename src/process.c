@@ -24,6 +24,17 @@ static uint64_t current_milliseconds(void)
 		(uint64_t)now.tv_usec / 1000ULL;
 }
 
+static process_tick_cb idle_tick;
+static unsigned int idle_tick_ms;
+static void *idle_opaque;
+
+void process_set_idle(process_tick_cb tick, unsigned int tick_ms, void *opaque)
+{
+	idle_tick = tick;
+	idle_tick_ms = tick_ms;
+	idle_opaque = opaque;
+}
+
 static void emit_lines(char *pending, size_t *pending_length,
 	const char *data, size_t length, process_line_cb callback, void *opaque)
 {
@@ -55,6 +66,7 @@ struct run_state {
 	process_tick_cb tick;
 	unsigned int tick_ms;
 	uint64_t next_tick;
+	uint64_t next_idle_tick;
 	void *opaque;
 };
 
@@ -104,13 +116,14 @@ static void write_input(int fd, const char *text)
 
 static void tick_if_due(struct run_state *run)
 {
-	uint64_t now;
-	if (!run->tick || !run->tick_ms)
-		return;
-	now = current_milliseconds();
-	if (now >= run->next_tick) {
+	uint64_t now = current_milliseconds();
+	if (run->tick && run->tick_ms && now >= run->next_tick) {
 		run->tick(run->opaque);
 		run->next_tick = now + run->tick_ms;
+	}
+	if (idle_tick && idle_tick_ms && now >= run->next_idle_tick) {
+		idle_tick(idle_opaque);
+		run->next_idle_tick = now + idle_tick_ms;
 	}
 }
 
@@ -118,14 +131,22 @@ static void tick_if_due(struct run_state *run)
 static uint64_t wait_time(const struct run_state *run)
 {
 	uint64_t now;
-	uint64_t remaining;
+	uint64_t remaining = 250;
+	uint64_t until;
 	if (run->child_reaped)
 		return 0;
-	if (!run->tick || !run->tick_ms)
-		return 250;
 	now = current_milliseconds();
-	remaining = run->next_tick > now ? run->next_tick - now : 0;
-	return remaining > 250 ? 250 : remaining;
+	if (run->tick && run->tick_ms) {
+		until = run->next_tick > now ? run->next_tick - now : 0;
+		if (until < remaining)
+			remaining = until;
+	}
+	if (idle_tick && idle_tick_ms) {
+		until = run->next_idle_tick > now ? run->next_idle_tick - now : 0;
+		if (until < remaining)
+			remaining = until;
+	}
+	return remaining;
 }
 
 /* One round of reading the output, 0 when the output or the child ended. */
@@ -222,8 +243,13 @@ static int process_run_internal(char *const argv[], const char *stdin_text,
 		write_input(input_pipe[1], stdin_text);
 		close(input_pipe[1]);
 	}
-	if (tick && tick_ms)
-		run.next_tick = current_milliseconds() + tick_ms;
+	{
+		uint64_t now = current_milliseconds();
+		if (tick && tick_ms)
+			run.next_tick = now + tick_ms;
+		if (idle_tick && idle_tick_ms)
+			run.next_idle_tick = now + idle_tick_ms;
+	}
 	while (run_step(&run))
 		continue;
 	return run_finish(&run);

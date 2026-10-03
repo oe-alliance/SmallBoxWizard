@@ -102,6 +102,12 @@ static void clock_tick(void)
 	ui_clock(&app.ui);
 }
 
+static void process_idle(void *opaque)
+{
+	(void)opaque;
+	ui_clock(&app.ui);
+}
+
 /* The steps on the left, the ones before current done. */
 static void step(enum step current)
 {
@@ -331,9 +337,27 @@ static const char *storage_hint(int count, int chkroot)
 /* The USB devices with the fake one of the demo, at most UI_MAX_ITEMS - 1; -1 when the scan failed. */
 static int scan_devices(struct storage_device devices[STORAGE_MAX_DEVICES], char *error, size_t error_size)
 {
-	int count = storage_scan_usb(devices, STORAGE_MAX_DEVICES, error, error_size);
+	int count = 0;
+	/* The USB-storage/SCSI attach on Linux 3.2 and 3.14 can finish a few
+	 * seconds after the physical hotplug event. A rescan therefore waits for
+	 * the block device instead of immediately presenting an empty list. */
+	for (int attempt = 0; attempt < 12 && !stop_requested; ++attempt) {
+		struct timespec delay = {0, 250000000L};
+		count = storage_scan_usb(devices, STORAGE_MAX_DEVICES, error, error_size);
+		if (count != 0)
+			break;
+		if (attempt < 11)
+			nanosleep(&delay, NULL);
+	}
 	if (count < 0)
 		return -1;
+	printf("[smallbox-wizard] USB scan: %d device%s found.\n", count, count == 1 ? "" : "s");
+	for (int i = 0; i < count; ++i) {
+		char label[192];
+		device_text(&devices[i], label, sizeof(label));
+		printf("[smallbox-wizard] USB scan: %s\n", label);
+	}
+	fflush(stdout);
 	if (app.demo && count < STORAGE_MAX_DEVICES)
 		devices[count++] = (struct storage_device){.name = "sdx", .path = "/dev/sdx",
 			.model = "Demo USB stick", .size_bytes = 32ULL << 30, .removable = 1};
@@ -455,6 +479,12 @@ static int connect_interface(const struct network_interface *interface, char *ch
 	} else
 		result = network_configure_dhcp(interface->name, progress, NULL, chosen_address, address_size, error,
 			error_size);
+	if (result)
+		printf("[smallbox-wizard] Network: %s IPv4=%s%s\n", interface->name, chosen_address,
+			app.demo ? " (demo)" : " (DHCP)");
+	else
+		fprintf(stderr, "[smallbox-wizard] Network: DHCP failed on %s: %s\n", interface->name, error);
+	fflush(result ? stdout : stderr);
 	app.busy = 0;
 	return result;
 }
@@ -487,6 +517,9 @@ static int configure_network(char *chosen_interface, size_t interface_size, char
 		if (map[choice] == -2) {
 			snprintf(chosen_interface, interface_size, "%s", current_interface);
 			snprintf(chosen_address, address_size, "%s", current_address);
+			printf("[smallbox-wizard] Network: %s IPv4=%s (already active)\n", current_interface,
+				current_address);
+			fflush(stdout);
 			return 1;
 		}
 		if (connect_interface(&interfaces[map[choice]], chosen_address, address_size, error, sizeof(error))) {
@@ -657,7 +690,11 @@ static int load_setup(struct wizard *w)
 	snprintf(s->receiver, sizeof(s->receiver), "%s", w->config.machine_build[0] ? w->config.machine_build :
 		w->config.machine);
 	ui_header(&app.ui, app.demo ? "Demo mode" : "");  /* The receiver is in the summary. */
-	eth0_ipv4(s->address, sizeof(s->address));
+	if (eth0_ipv4(s->address, sizeof(s->address)))
+		printf("[smallbox-wizard] Startup network: eth0 IPv4=%s\n", s->address);
+	else
+		printf("[smallbox-wizard] Startup network: eth0 has no IPv4 address.\n");
+	fflush(stdout);
 	return 1;
 }
 
@@ -800,11 +837,13 @@ static void reboot_receiver(void)
 static void finish(int chkroot)
 {
 	char footer[96];
+	char countdown[96];
 	const char *title = chkroot ? "Chkroot SmallBox is ready" : "SmallBox is ready";
 	const char *body = chkroot ?
 		"The complete Enigma2 root file system is installed in the verified USB slot. The internal kernel was "
-		"not flashed. The receiver restarts into Chkroot now.\n\n" KEEP_USB :
-		"FlashExpander, 512 MB swap, network and the SmallBox packages are ready. The receiver restarts now."
+		"not flashed. The receiver will restart automatically into Chkroot.\n\n" KEEP_USB :
+		"FlashExpander, 512 MB swap, network and the SmallBox packages are ready. The receiver will restart "
+		"automatically."
 		"\n\n" KEEP_USB;
 	step(STEP_DONE);
 	if (app.no_reboot || app.demo) {
@@ -812,9 +851,19 @@ static void finish(int chkroot)
 		show(title, body, footer, 0);
 		return;
 	}
+	for (int remaining = 10; remaining > 0; --remaining) {
+		snprintf(countdown, sizeof(countdown), "Restarting in %d second%s...", remaining,
+			remaining == 1 ? "" : "s");
+		summary(1);
+		ui_screen(&app.ui, title, body, countdown);
+		/* Keep LVGL's spinner moving while deliberately ignoring keys. */
+		for (int tenth = 0; tenth < 10; ++tenth) {
+			input_wait(&app.input, 100);
+			ui_clock(&app.ui);
+		}
+	}
 	summary(1);
-	ui_screen(&app.ui, title, body, "Restarting...");
-	sleep(2);
+	ui_screen(&app.ui, title, body, "Restarting now...");
 	reboot_receiver();
 }
 
@@ -909,8 +958,10 @@ int main(int argc, char **argv)
 	}
 	input_set_global(global_key);
 	input_set_press(key_pressed);
-	input_set_clock(clock_tick);
+	input_set_idle(clock_tick);
+	process_set_idle(process_idle, 100, NULL);
 	result = run_wizard();
+	process_set_idle(NULL, 0, NULL);
 	input_close(&app.input);
 	ui_clear(&app.ui, (struct ui_color){0, 0, 0, 255});
 	ui_present(&app.ui);

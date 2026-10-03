@@ -30,7 +30,9 @@
 #define FSTAB_BEGIN "# SMALLBOX-WIZARD BEGIN"
 #define FSTAB_END "# SMALLBOX-WIZARD END"
 #define SWAP_BYTES (512ULL * 1024ULL * 1024ULL)
-#define MIN_DATA_BYTES (512ULL * 1024ULL * 1024ULL)
+/* Nominal 1 GiB USB media commonly report a few sectors less than 1024 MiB.
+ * Leave room for alignment while preserving roughly 500 MiB for /usr. */
+#define MIN_DATA_BYTES (500ULL * 1024ULL * 1024ULL)
 
 __attribute__((format(printf, 3, 4)))
 static void set_error(char *error, size_t error_size, const char *format, ...)  /* NOSONAR printf-style helper */
@@ -94,14 +96,6 @@ static int is_disk_name(const char *name)
 			return 0;
 	}
 	return 1;
-}
-
-static const char *block_sysfs_root(void)
-{
-	struct stat status;
-	if (stat("/sys/class/block", &status) == 0 && S_ISDIR(status.st_mode))
-		return "/sys/class/block";
-	return "/sys/block";
 }
 
 static int path_is_usb(const char *sysfs_root, const char *name)
@@ -202,71 +196,90 @@ static int device_compare(const void *left, const void *right)
 	return strcmp(a->name, b->name);
 }
 
+static int device_already_listed(const struct storage_device devices[], int count,
+	const char *name)
+{
+	for (int i = 0; i < count; ++i) {
+		if (strcmp(devices[i].name, name) == 0)
+			return 1;
+	}
+	return 0;
+}
+
 int storage_scan_usb(struct storage_device devices[], int maximum,
 	char *error, size_t error_size)
 {
 	DIR *directory;
 	struct dirent *entry;
 	struct dev_numbers critical;
-	const char *sysfs_root;
+	static const char *const sysfs_roots[] = {"/sys/class/block", "/sys/block"};
 	int count = 0;
+	int opened = 0;
 
 	if (!devices || maximum <= 0) {
 		set_error(error, error_size, "Invalid output buffer.");
 		return -1;
 	}
 	read_critical_devices(&critical);
-	sysfs_root = block_sysfs_root();
-	directory = opendir(sysfs_root);
-	if (!directory) {
+	/* Linux 3.2/3.14 receivers normally expose disks only below /sys/block,
+	 * while newer kernels also provide /sys/class/block. Scan both when
+	 * available and deduplicate by kernel disk name. */
+	for (size_t root = 0; root < sizeof(sysfs_roots) / sizeof(sysfs_roots[0]) &&
+		count < maximum; ++root) {
+		const char *sysfs_root = sysfs_roots[root];
+		directory = opendir(sysfs_root);
+		if (!directory)
+			continue;
+		opened = 1;
+		while ((entry = readdir(directory)) != NULL && count < maximum) {
+			struct storage_device *device;
+			char sys_path[PATH_MAX];
+			char value[128];
+			char *end = NULL;
+			size_t name_length;
+			unsigned long long sectors;
+			struct stat status;
+
+			if (!is_disk_name(entry->d_name) ||
+				device_already_listed(devices, count, entry->d_name) ||
+				!path_is_usb(sysfs_root, entry->d_name) ||
+				disk_contains_critical(sysfs_root, entry->d_name, &critical))
+				continue;
+			device = &devices[count];
+			memset(device, 0, sizeof(*device));
+			name_length = strnlen(entry->d_name, sizeof(device->name));
+			if (name_length == sizeof(device->name))
+				continue;
+			memcpy(device->name, entry->d_name, name_length + 1);
+			snprintf(device->path, sizeof(device->path), "/dev/%s", device->name);
+			if (stat(device->path, &status) < 0 || !S_ISBLK(status.st_mode))
+				continue;
+			snprintf(sys_path, sizeof(sys_path), "%s/%s/size", sysfs_root,
+				entry->d_name);
+			if (!read_text(sys_path, value, sizeof(value)))
+				continue;
+			errno = 0;
+			sectors = strtoull(value, &end, 10);
+			if (errno || end == value || sectors == 0)
+				continue;
+			device->size_bytes = (uint64_t)sectors * 512ULL;
+			snprintf(sys_path, sizeof(sys_path), "%s/%s/removable", sysfs_root,
+				entry->d_name);
+			device->removable = read_text(sys_path, value, sizeof(value)) &&
+				atoi(value) != 0;
+			snprintf(sys_path, sizeof(sys_path), "%s/%s/device/model", sysfs_root,
+				entry->d_name);
+			if (!read_text(sys_path, device->model, sizeof(device->model)))
+				snprintf(device->model, sizeof(device->model), "USB storage");
+			count++;
+		}
+		closedir(directory);
+	}
+	if (!opened) {
 		set_error(error, error_size, "Block devices cannot be read: %s",
 			strerror(errno));
 		return -1;
 	}
-	while ((entry = readdir(directory)) != NULL && count < maximum) {
-		struct storage_device *device;
-		char sys_path[PATH_MAX];
-		char value[128];
-		char *end = NULL;
-		size_t name_length;
-		unsigned long long sectors;
-		struct stat status;
-
-		if (!is_disk_name(entry->d_name) ||
-			!path_is_usb(sysfs_root, entry->d_name) ||
-			disk_contains_critical(sysfs_root, entry->d_name, &critical))
-			continue;
-		device = &devices[count];
-		memset(device, 0, sizeof(*device));
-		name_length = strnlen(entry->d_name, sizeof(device->name));
-		if (name_length == sizeof(device->name))
-			continue;
-		memcpy(device->name, entry->d_name, name_length + 1);
-		snprintf(device->path, sizeof(device->path), "/dev/%s", device->name);
-		if (stat(device->path, &status) < 0 || !S_ISBLK(status.st_mode))
-			continue;
-		snprintf(sys_path, sizeof(sys_path), "%s/%s/size", sysfs_root,
-			entry->d_name);
-		if (!read_text(sys_path, value, sizeof(value)))
-			continue;
-		errno = 0;
-		sectors = strtoull(value, &end, 10);
-		if (errno || end == value || sectors == 0)
-			continue;
-		device->size_bytes = (uint64_t)sectors * 512ULL;
-		if (device->size_bytes < SWAP_BYTES + MIN_DATA_BYTES)
-			continue;
-		snprintf(sys_path, sizeof(sys_path), "%s/%s/removable", sysfs_root,
-			entry->d_name);
-		device->removable = read_text(sys_path, value, sizeof(value)) &&
-			atoi(value) != 0;
-		snprintf(sys_path, sizeof(sys_path), "%s/%s/device/model", sysfs_root,
-			entry->d_name);
-		if (!read_text(sys_path, device->model, sizeof(device->model)))
-			snprintf(device->model, sizeof(device->model), "USB storage");
-		count++;
-	}
-	closedir(directory);
 	qsort(devices, (size_t)count, sizeof(devices[0]), device_compare);
 	if (error && error_size)
 		error[0] = '\0';

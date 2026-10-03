@@ -33,6 +33,7 @@ struct ui_context {
 	struct fb_var_screeninfo var;
 	struct fb_fix_screeninfo fix;
 	int manual_blit;
+	int console_graphics;
 	char device[32];
 };
 

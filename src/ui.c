@@ -6,6 +6,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/kd.h>
 #include <linux/types.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -175,7 +176,9 @@ static uint32_t pack_pixel(const struct ui_context *ui, uint8_t r, uint8_t g, ui
 static int native_layout(const struct ui_context *ui)
 {
 	return ui->var.bits_per_pixel == 32 && ui->var.red.offset == 16 && ui->var.green.offset == 8 &&
-		!ui->var.blue.offset && ui->var.red.length == 8;
+		!ui->var.blue.offset && ui->var.red.length == 8 && ui->var.green.length == 8 &&
+		ui->var.blue.length == 8 && (!ui->var.transp.length ||
+		(ui->var.transp.offset == 24 && ui->var.transp.length == 8));
 }
 
 static void put_pixels(const struct ui_context *ui, uint8_t *to, const uint8_t *from, int count)
@@ -183,6 +186,12 @@ static void put_pixels(const struct ui_context *ui, uint8_t *to, const uint8_t *
 	unsigned int bytes = ui->var.bits_per_pixel / 8;
 	if (native_layout(ui)) {
 		memcpy(to, from, (size_t)count * 4);
+		if (ui->var.transp.length) {
+			uint32_t opaque = scale_channel(0xff, ui->var.transp.length) << ui->var.transp.offset;
+			uint32_t *pixels = (uint32_t *)to;
+			for (int x = 0; x < count; ++x)
+				pixels[x] |= opaque;
+		}
 		return;
 	}
 	for (int x = 0; x < count; ++x, from += 4, to += bytes) {
@@ -477,8 +486,15 @@ static void render(void)
 void ui_clock(const struct ui_context *ui)
 {
 	(void)ui;
-	if (display && active && active->screen && header_update())
-		lv_refr_now(display);
+	if (display && active && active->screen) {
+		int redraw = header_update();
+		if (busy) {
+			busy_update();
+			redraw = 1;
+		}
+		if (redraw)
+			lv_refr_now(display);
+	}
 }
 
 static void sidebar_style(void)
@@ -811,6 +827,85 @@ static void open_device(struct ui_context *ui)
 	}
 }
 
+static int environment_dimension(const char *name, int fallback)
+{
+	const char *value = getenv(name);
+	char *end;
+	long number;
+	if (!value || !*value)
+		return fallback;
+	errno = 0;
+	number = strtol(value, &end, 10);
+	if (errno || *end || number < 320 || number > 4096)
+		return fallback;
+	return (int)number;
+}
+
+static int valid_color_layout(const struct fb_var_screeninfo *var)
+{
+	return var->bits_per_pixel == 32 && var->red.offset == 16 && var->red.length == 8 &&
+		var->green.offset == 8 && var->green.length == 8 && !var->blue.offset && var->blue.length == 8 &&
+		(!var->transp.length || (var->transp.offset == 24 && var->transp.length == 8));
+}
+
+static void set_argb8888(struct fb_var_screeninfo *var)
+{
+	var->bits_per_pixel = 32;
+	var->red.offset = 16;
+	var->red.length = 8;
+	var->green.offset = 8;
+	var->green.length = 8;
+	var->blue.offset = 0;
+	var->blue.length = 8;
+	var->transp.offset = 24;
+	var->transp.length = 8;
+}
+
+/* Enigma2 configures both the OSD geometry and ARGB layout before drawing.
+ * Some legacy bcmfb drivers boot with a PAL-sized surface and report every
+ * color channel at offset zero until this FBIOPUT call is made. */
+static void framebuffer_mode(struct ui_context *ui)
+{
+	struct fb_var_screeninfo requested = ui->var;
+	int width = environment_dimension("SMALLBOX_FB_WIDTH", (int)ui->var.xres);
+	int height = environment_dimension("SMALLBOX_FB_HEIGHT", (int)ui->var.yres);
+	int configured = 0;
+
+	if (width == (int)ui->var.xres && height == (int)ui->var.yres && valid_color_layout(&ui->var))
+		return;
+	requested.xres = (uint32_t)width;
+	requested.yres = (uint32_t)height;
+	requested.xres_virtual = (uint32_t)width;
+	requested.yres_virtual = (uint32_t)height * 2;
+	requested.xoffset = 0;
+	requested.yoffset = 0;
+	requested.width = 0;
+	requested.height = 0;
+	requested.activate = FB_ACTIVATE_ALL;
+	set_argb8888(&requested);
+	if (ioctl(ui->fd, FBIOPUT_VSCREENINFO, &requested) == 0)
+		configured = 1;
+	else {
+		requested.yres_virtual = (uint32_t)height;
+		if (ioctl(ui->fd, FBIOPUT_VSCREENINFO, &requested) == 0)
+			configured = 1;
+	}
+	if (configured && ioctl(ui->fd, FBIOGET_VSCREENINFO, &ui->var) == 0 &&
+		ioctl(ui->fd, FBIOGET_FSCREENINFO, &ui->fix) == 0) {
+		fprintf(stderr, "[smallbox-wizard] Framebuffer: configured %ux%u ARGB8888.\n",
+			ui->var.xres, ui->var.yres);
+		return;
+	}
+
+	/* The memory layout of these bcmfb implementations is ARGB8888 even when
+	 * their old FBIOGET implementation leaves all bitfield offsets at zero. */
+	if (!valid_color_layout(&ui->var)) {
+		set_argb8888(&ui->var);
+		fprintf(stderr, "[smallbox-wizard] Framebuffer: driver rejected mode setup; assuming ARGB8888.\n");
+	} else
+		fprintf(stderr, "[smallbox-wizard] Framebuffer: mode setup failed: %s\n", strerror(errno));
+}
+
 /* The display in the mode of ui, 0 without memory for it. */
 static int display_setup(const struct ui_context *ui)
 {
@@ -832,6 +927,25 @@ static int display_setup(const struct ui_context *ui)
 	return 1;
 }
 
+/* The framebuffer can be mapped successfully while the virtual console still
+ * owns the display. Enigma2 switches tty0 to graphics mode for the same
+ * reason; without it several older receivers only show a black screen. */
+static void console_mode(struct ui_context *ui, int graphics)
+{
+	int fd = open("/dev/tty0", O_RDWR | O_CLOEXEC);
+	if (fd < 0) {
+		if (graphics)
+			fprintf(stderr, "[smallbox-wizard] Framebuffer: cannot open /dev/tty0: %s\n", strerror(errno));
+		return;
+	}
+	if (ioctl(fd, KDSETMODE, graphics ? KD_GRAPHICS : KD_TEXT) < 0) {
+		if (graphics)
+			fprintf(stderr, "[smallbox-wizard] Framebuffer: KD_GRAPHICS failed: %s\n", strerror(errno));
+	} else
+		ui->console_graphics = graphics;
+	close(fd);
+}
+
 int ui_open(struct ui_context *ui)
 {
 	unsigned char manual = 1;
@@ -846,6 +960,7 @@ int ui_open(struct ui_context *ui)
 	if (ioctl(ui->fd, FBIOGET_VSCREENINFO, &ui->var) < 0 ||
 		ioctl(ui->fd, FBIOGET_FSCREENINFO, &ui->fix) < 0)
 		goto failed;
+	framebuffer_mode(ui);
 	if (ui->var.bits_per_pixel != 16 && ui->var.bits_per_pixel != 24 && ui->var.bits_per_pixel != 32) {
 		errno = ENOTSUP;
 		goto failed;
@@ -859,8 +974,17 @@ int ui_open(struct ui_context *ui)
 		ui->screen = NULL;
 		goto failed;
 	}
+	console_mode(ui, 1);
 	if (ioctl(ui->fd, FBIO_SET_MANUAL_BLIT, &manual) == 0)
 		ui->manual_blit = 1;
+	fprintf(stderr,
+		"[smallbox-wizard] Framebuffer: %s %ux%u virtual=%ux%u bpp=%u stride=%u "
+		"RGBA=%u/%u,%u/%u,%u/%u,%u/%u manual-blit=%s\n",
+		ui->device, ui->var.xres, ui->var.yres, ui->var.xres_virtual, ui->var.yres_virtual,
+		ui->var.bits_per_pixel, ui->fix.line_length,
+		ui->var.red.offset, ui->var.red.length, ui->var.green.offset, ui->var.green.length,
+		ui->var.blue.offset, ui->var.blue.length, ui->var.transp.offset, ui->var.transp.length,
+		ui->manual_blit ? "yes" : "no");
 	active = ui;
 	if (!display) {
 		lv_init();
@@ -883,6 +1007,8 @@ failed:
 	if (ui->fd >= 0)
 		close(ui->fd);
 	ui->fd = -1;
+	if (ui->console_graphics)
+		console_mode(ui, 0);
 	active = NULL;
 	return 0;
 }
@@ -905,6 +1031,8 @@ void ui_close(struct ui_context *ui)
 		close(ui->fd);
 		ui->fd = -1;
 	}
+	if (ui->console_graphics)
+		console_mode(ui, 0);
 }
 
 void ui_clear(struct ui_context *ui, struct ui_color color)

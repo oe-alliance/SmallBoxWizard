@@ -6,6 +6,9 @@
 typedef void (*process_line_cb)(const char *line, void *opaque);
 typedef void (*process_tick_cb)(void *opaque);
 
+/* Runs while any child command is being waited for, independently of that
+ * command's own progress callback. Used to keep the framebuffer UI alive. */
+void process_set_idle(process_tick_cb tick, unsigned int tick_ms, void *opaque);
 int process_run(char *const argv[], const char *stdin_text,
 	process_line_cb callback, void *opaque);
 int process_run_with_updates(char *const argv[], const char *stdin_text,
