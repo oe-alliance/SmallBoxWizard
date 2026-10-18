@@ -1304,8 +1304,6 @@ static int optional_service_link(const char *name)
 		"nfsserver",
 		"samba",
 		"smartd",
-		"telnetd.busybox",
-		"vsftpd",
 		"wsdd",
 		"wsdd2",
 		NULL
