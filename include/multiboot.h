@@ -31,6 +31,7 @@ struct multiboot_layout {
 	char disk_name[32];
 	char startup_partition[64];
 	char root_partition[64];
+	char root_fstype[8];
 	char swap_partition[64];
 	char root_uuid[128];
 	char swap_uuid[128];

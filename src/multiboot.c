@@ -475,7 +475,8 @@ static int write_startup_files(const struct multiboot_config *config,
 	for (int slot = 1; slot <= layout->slot_count; ++slot) {
 		snprintf(external_startup, sizeof(external_startup),
 			"kernel=%s root=UUID=%s rootsubdir=linuxrootfs%d "
-			"rootfstype=ext4\n", kernel, layout->root_uuid, slot);
+			"rootfstype=%s\n", kernel, layout->root_uuid, slot,
+			layout->root_fstype);
 		snprintf(path, sizeof(path), "%s/STARTUP_%d", STARTUP_MOUNT, slot);
 		if (!write_atomic(path, external_startup, 0644))
 			goto write_failed;
@@ -497,7 +498,7 @@ failed:
 struct partition_tools {
 	char sfdisk[PATH_MAX];
 	char mkfs_vfat[PATH_MAX];
-	char mkfs_ext4[PATH_MAX];
+	char mkfs_root[PATH_MAX];
 	char mkswap[PATH_MAX];
 };
 
@@ -523,6 +524,11 @@ static int init_layout(const struct storage_device *device,
 	char *error, size_t error_size)
 {
 	memset(layout, 0, sizeof(*layout));
+	/* GB7325 has built-in ext3; ext4 remains a module to fit its kernel flash. */
+	snprintf(layout->root_fstype, sizeof(layout->root_fstype), "%s",
+		strcmp(config->machine, "gb7325") == 0 ||
+		strcmp(config->machine_build, "gb800se") == 0 ||
+		strcmp(config->machine_build, "gb800ue") == 0 ? "ext3" : "ext4");
 	snprintf(layout->disk, sizeof(layout->disk), "%s", device->path);
 	snprintf(layout->disk_name, sizeof(layout->disk_name), "%s", device->name);
 	if (!partition_path(device, 1, layout->startup_partition,
@@ -592,11 +598,11 @@ static int find_partition_tools(struct partition_tools *tools, char *error,
 {
 	if (!process_find("sfdisk", tools->sfdisk, sizeof(tools->sfdisk)) ||
 		!process_find("mkfs.vfat", tools->mkfs_vfat, sizeof(tools->mkfs_vfat)) ||
-		(!process_find("mkfs.ext4", tools->mkfs_ext4, sizeof(tools->mkfs_ext4)) &&
-		 !process_find("mke2fs", tools->mkfs_ext4, sizeof(tools->mkfs_ext4))) ||
+		(!process_find("mke2fs", tools->mkfs_root, sizeof(tools->mkfs_root)) &&
+		 !process_find("mkfs.ext4", tools->mkfs_root, sizeof(tools->mkfs_root))) ||
 		!process_find("mkswap", tools->mkswap, sizeof(tools->mkswap))) {
 		set_error(error, error_size,
-			"Required GPT, FAT, ext4 or swap tools are missing.");
+			"Required GPT, FAT, ext filesystem or swap tools are missing.");
 		return 0;
 	}
 	return 1;
@@ -644,6 +650,7 @@ static int format_partitions(struct partition_tools *tools,
 	struct multiboot_layout *layout, multiboot_progress_cb callback,
 	void *opaque, char *error, size_t error_size)
 {
+	char status[128];
 	progress(callback, opaque, 20, "Formatting the STARTUP partition as FAT32...");
 	{
 		char *argv[] = {tools->mkfs_vfat, "-F", "32", "-n", "STARTUP",
@@ -653,10 +660,12 @@ static int format_partitions(struct partition_tools *tools,
 			return 0;
 		}
 	}
-	progress(callback, opaque, 30,
-		"Formatting the Chkroot rootfs partition as legacy-compatible ext4...");
+	snprintf(status, sizeof(status),
+		"Formatting the Chkroot rootfs partition as legacy-compatible %s...",
+		layout->root_fstype);
+	progress(callback, opaque, 30, status);
 	{
-		char *argv[] = {tools->mkfs_ext4, "-F", "-t", "ext4", "-L", "rootfs",
+		char *argv[] = {tools->mkfs_root, "-F", "-t", layout->root_fstype, "-L", "rootfs",
 			"-m", "0", "-O",
 			"^64bit,^extent,^flex_bg,^huge_file,^dir_nlink,^extra_isize,^metadata_csum",
 			layout->root_partition, NULL};
@@ -708,7 +717,7 @@ static int mount_media_root(const struct multiboot_layout *layout, char *error,
 		set_error(error, error_size, "The persistent media mount cannot be created.");
 		return 0;
 	}
-	if (mount(layout->root_partition, layout->media_mount, "ext4", 0, NULL) < 0) {
+	if (mount(layout->root_partition, layout->media_mount, layout->root_fstype, 0, NULL) < 0) {
 		set_error(error, error_size, "The Chkroot rootfs partition cannot be mounted.");
 		return 0;
 	}
@@ -1280,8 +1289,8 @@ static int update_target_fstab(const struct multiboot_layout *layout,
 		fclose(input);
 	}
 	fprintf(output, "\n%s\n", FSTAB_BEGIN);
-	fprintf(output, "UUID=%s %s ext4 defaults,noatime 0 0\n",
-		layout->root_uuid, layout->media_mount);
+	fprintf(output, "UUID=%s %s %s defaults,noatime 0 0\n",
+		layout->root_uuid, layout->media_mount, layout->root_fstype);
 	fprintf(output, "UUID=%s none swap sw 0 0\n", layout->swap_uuid);
 	fprintf(output, "%s\n", FSTAB_END);
 	written = fflush(output) == 0 && fsync(fd) == 0;
