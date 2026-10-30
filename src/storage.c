@@ -29,6 +29,8 @@
 #define EXPANDER_META_REL ".smallbox-wizard"
 #define FSTAB_BEGIN "# SMALLBOX-WIZARD BEGIN"
 #define FSTAB_END "# SMALLBOX-WIZARD END"
+#define LEGACY_EXT4_FEATURES \
+	"^64bit,^extent,^flex_bg,^huge_file,^dir_nlink,^extra_isize,^metadata_csum"
 #define SWAP_BYTES (512ULL * 1024ULL * 1024ULL)
 /* Nominal 1 GiB USB media commonly report a few sectors less than 1024 MiB.
  * Leave room for alignment while preserving roughly 500 MiB for /usr. */
@@ -948,7 +950,8 @@ static int format_partitions(struct prepare_state *state)
 	char mkfs[PATH_MAX];
 	char mkswap[PATH_MAX];
 	char *mkfs_argv[] = {mkfs, "-F", "-t", "ext4", "-L",
-		"FLASH_EXPANDER", "-m", "0", state->part1, NULL};
+		"FLASH_EXPANDER", "-m", "0", "-O", LEGACY_EXT4_FEATURES,
+		state->part1, NULL};
 	char *mkswap_argv[] = {mkswap, "-L", "SMALLBOX_SWAP", state->part2, NULL};
 
 	if (!process_find("mkfs.ext4", mkfs, sizeof(mkfs)) &&
@@ -958,7 +961,7 @@ static int format_partitions(struct prepare_state *state)
 		return 0;
 	}
 	progress(state->callback, state->opaque, 22,
-		"Formatting the FlashExpander as ext4...");
+		"Formatting the FlashExpander as legacy-compatible ext4...");
 	if (process_run(mkfs_argv, NULL, NULL, NULL) != 0) {
 		set_error(state->error, state->error_size,
 			"Formatting the ext4 partition failed.");
